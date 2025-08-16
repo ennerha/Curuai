@@ -1,0 +1,373 @@
+# ============================================================
+# Curuai | Inferência MODIS (MOD09GA) -> Chl-a (mg/m³)
+# - Escala MODIS 0.0001 aplicada antes das features
+# - Features compatíveis com treino (ordem = top_features do pkl)
+# - Modelo two-stage (classifier + low/high regressor)
+# - Exporta rasters mensais já em mg/m³ + série temporal CSV
+# ============================================================
+
+# !pip -q install earthengine-api rasterio shapely geopandas tqdm joblib
+
+import os, re, json, math, glob, warnings, tempfile
+from pathlib import Path
+import numpy as np, pandas as pd
+import rasterio as rio
+from rasterio.merge import merge as rio_merge
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import joblib
+import ee
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+EE_PROJECT = "ee-enneralcantarabariri"  # seu projeto EE
+OUTROOT    = Path("/content/artifacts_curuai_modis_only")  # raiz de saída
+FEAT_DIR   = OUTROOT / "features"; FEAT_DIR.mkdir(parents=True, exist_ok=True)
+PRED_TDIR  = OUTROOT / "pred_tiles"; PRED_TDIR.mkdir(parents=True, exist_ok=True)
+PRED_DIR   = OUTROOT / "pred"; PRED_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_PATH = Path("/content/artifacts_curuai/curuai_two_stage.pkl")  # gerado no treino
+# período
+START_YM, END_YM = "2013-01", "2024-12"
+# ROI (retângulo simples como no seu log)
+ROI_BOUNDS = [-56.4, -2.55, -56.05, -2.25]  # [minlon, minlat, maxlon, maxlat]
+# grade de tiles
+TILES_NX, TILES_NY = 4, 4
+# resolução e CRS
+SCALE = 250  # m (MODIS 250/500 m; estamos usando 250 m)
+CRS   = "EPSG:4326"
+
+# ----------------------------
+# EARTH ENGINE – init
+# ----------------------------
+try:
+    ee.Initialize(project=EE_PROJECT)
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT)
+print("EE ok:", EE_PROJECT)
+
+# ----------------------------
+# Helpers de data e ROI
+# ----------------------------
+def months_between(start_ym: str, end_ym: str):
+    ys, ms = map(int, start_ym.split("-"))
+    ye, me = map(int, end_ym.split("-"))
+    cur_y, cur_m = ys, ms
+    out = []
+    while (cur_y < ye) or (cur_y == ye and cur_m <= me):
+        out.append(f"{cur_y:04d}-{cur_m:02d}")
+        cur_m += 1
+        if cur_m == 13:
+            cur_m = 1; cur_y += 1
+    return out
+
+def ym_to_dates(ym: str):
+    y, m = map(int, ym.split("-"))
+    if m == 12:
+        return f"{y:04d}-{m:02d}-01", f"{y+1:04d}-01-01"
+    else:
+        return f"{y:04d}-{m:02d}-01", f"{y:04d}-{m+1:02d}-01"
+
+ROI = ee.Geometry.Rectangle(ROI_BOUNDS, proj=CRS, geodesic=False)
+
+# ----------------------------
+# MODIS -> Rrs + features (EE)
+# ----------------------------
+# MOD09GA: sur_refl_b01 (RED ~645nm), b03 (BLUE ~469nm), b04 (GREEN ~555nm)
+# Usamos nomes compatíveis com o treino:
+#   Rrs_665 ≈ b01(645) | Rrs_490 ≈ b03(469) | Rrs_560 ≈ b04(555)
+def modis_surface_reflectance(img):
+    bands = img.select(['sur_refl_b01','sur_refl_b03','sur_refl_b04']).multiply(0.0001)
+    return bands.rename(['Rrs_665','Rrs_490','Rrs_560'])
+
+def add_basic_feats(img):
+    R665 = img.select('Rrs_665')
+    R490 = img.select('Rrs_490')
+    R560 = img.select('Rrs_560')
+
+    normL1 = R665.add(R490).add(R560).add(1e-12).rename("norm_Rrs_L1")
+
+    def norm560(b): 
+        return b.divide(R560.add(1e-12))
+
+    feats = [
+        R665, R490, R560,
+        normL1
+    ]
+    # *_norm560
+    feats += [
+        norm560(R665).rename('Rrs_665_norm560'),
+        norm560(R490).rename('Rrs_490_norm560'),
+        norm560(R560).rename('Rrs_560_norm560')
+    ]
+    # *_normL1
+    feats += [
+        R665.divide(normL1).rename('Rrs_665_normL1'),
+        R490.divide(normL1).rename('Rrs_490_normL1'),
+        R560.divide(normL1).rename('Rrs_560_normL1')
+    ]
+    # índices que existem com 490/560/665
+    feats += [
+        R560.divide(R490.add(1e-12)).rename('G_over_B'),
+        R490.divide(R665.add(1e-12)).rename('B_over_R')
+    ]
+    # áreas aproximadas
+    feats += [
+        R490.rename('Area_Blue'),
+        R560.rename('Area_Green'),
+        R665.rename('Area_Red'),
+        ee.Image.constant(0).rename('Area_RE')  # não há 700–710 no MODIS
+    ]
+
+    # Derivadas (ordem Rrs_490, Rrs_560, Rrs_665)
+    arr = img.select(['Rrs_490','Rrs_560','Rrs_665']).toArray()
+    d1 = arr.arraySlice(0,1).subtract(arr.arraySlice(0,0,2))  # diffs nas 2 gaps
+    # média e p95 (de 2 valores) – aproximamos p95 com max
+    d1_mean = d1.arrayReduce(ee.Reducer.mean(), [0]).arrayGet([0]).rename('d1_mean')
+    d1_max  = d1.arrayReduce(ee.Reducer.max(),  [0]).arrayGet([0]).rename('d1_p95')
+    # 2ª derivada (1 valor)
+    d2 = arr.arraySlice(0,2).subtract(arr.arraySlice(0,1)).subtract(
+         arr.arraySlice(0,1).subtract(arr.arraySlice(0,0)))  # (b3-b2)-(b2-b1)
+    d2_mean = d2.arrayReduce(ee.Reducer.mean(), [0]).arrayGet([0]).rename('d2_mean')
+    d2_max  = d2.arrayReduce(ee.Reducer.max(),  [0]).arrayGet([0]).rename('d2_p95')
+
+    feats += [d1_mean, d1_max, d2_mean, d2_max]
+
+    return img.addBands(ee.Image.cat(feats), overwrite=True)
+
+def build_feature_image(ym: str, model_features: list):
+    d1, d2 = ym_to_dates(ym)
+    col = (ee.ImageCollection('MODIS/006/MOD09GA')
+           .filterDate(d1, d2)
+           .filterBounds(ROI)
+           .map(modis_surface_reflectance)
+           .map(add_basic_feats))
+
+    # mosaico robusto (mediana)
+    mos = col.median().clip(ROI)
+
+    # cria imagem com as bandas na MESMA ORDEM do modelo
+    bands = []
+    for name in model_features:
+        if mos.bandNames().contains(name).getInfo():
+            bands.append(mos.select(name))
+        else:
+            # feature indisponível -> constante ~0 (não ideal, mas evita quebra)
+            bands.append(ee.Image.constant(0).rename(name))
+    feat_img = ee.Image.cat(bands).rename(model_features)
+    return feat_img
+
+# ----------------------------
+# Export (download) via thumb getPixels
+# ----------------------------
+def ee_export_tif(img, region, scale, crs, out_path):
+    # Usa thumbnail:getPixels (rápido e síncrono para tiles)
+    params = {
+        'region': region,
+        'scale': scale,
+        'crs': crs,
+        'format': 'GEO_TIFF'
+    }
+    url = img.getThumbURL(params)
+    import requests
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
+    with open(out_path, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1<<20):
+            if chunk: f.write(chunk)
+    return out_path
+
+# ----------------------------
+# Grade de tiles
+# ----------------------------
+def split_rect(rect: ee.Geometry, nx=4, ny=4):
+    coords = rect.bounds().coordinates().get(0).getInfo()
+    xs = [c[0] for c in coords[:-1]]
+    ys = [c[1] for c in coords[:-1]]
+    minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+    dx = (maxx - minx)/nx; dy = (maxy - miny)/ny
+    tiles = []
+    for j in range(ny):
+        for i in range(nx):
+            x0 = minx + i*dx; x1 = x0 + dx
+            y0 = miny + j*dy; y1 = y0 + dy
+            tiles.append(ee.Geometry.Rectangle([x0,y0,x1,y1], proj=CRS, geodesic=False))
+    return tiles
+
+TILES = split_rect(ROI, TILES_NX, TILES_NY)
+
+# ----------------------------
+# Carrega modelo two-stage
+# ----------------------------
+assert MODEL_PATH.exists(), f"Modelo não encontrado: {MODEL_PATH}"
+art = joblib.load(MODEL_PATH)
+# padrão salvo no seu treino:
+# {"classifier": CLS_BEST, "low_regressor": LOW_REG, "high_regressor": HIGH_REG, "features": top_features, ...}
+cls = art.get("classifier") or art.get("clf")
+reg_low  = art.get("low_regressor")  or art.get("reg_low")
+reg_high = art.get("high_regressor") or art.get("reg_high")
+model_features = art["features"]
+print("✓ Modelo carregado:", MODEL_PATH)
+print("✓ Features alvo carregadas:", len(model_features))
+
+# ----------------------------
+# Predição em tiles (por mês) + mosaico e inversa (mg/m³)
+# ----------------------------
+def raster_to_X(ds: rio.io.DatasetReader):
+    arr = ds.read()  # (bands, rows, cols)
+    n_b, n_r, n_c = arr.shape
+    X = arr.reshape(n_b, n_r*n_c).T  # (N, nb)
+    return X, (n_r, n_c)
+
+def predict_two_stage(X):
+    # retorna yhat_log (mesmo domínio do treino)
+    # classifica
+    pred_class = cls.predict(X).astype(int)
+    yhat = np.full(X.shape[0], np.nan, dtype="float64")
+    m0 = pred_class == 0
+    m1 = ~m0
+    if m0.any():
+        yhat[m0] = reg_low.predict(X[m0])
+    if m1.any():
+        yhat[m1] = reg_high.predict(X[m1])
+    return yhat
+
+def write_geotiff_like(template_path, out_path, data2d, nodata=np.nan, tags=None):
+    with rio.open(template_path) as src:
+        prof = src.profile.copy()
+        prof.update({
+            "count": 1,
+            "dtype": "float32",
+            "nodata": nodata
+        })
+        with rio.open(out_path, "w", **prof) as dst:
+            dst.write(data2d.astype("float32"), 1)
+            if tags:
+                dst.update_tags(**tags)
+
+def mosaic_month(ym, tile_tifs, out_dir=PRED_DIR):
+    if len(tile_tifs) == 1:
+        # nome final
+        final = out_dir / f"curuai_chla_{ym}.tif"
+        # só copia com tags
+        with rio.open(tile_tifs[0]) as src:
+            prof = src.profile
+            data = src.read(1)
+            with rio.open(final, "w", **prof) as dst:
+                dst.write(data, 1)
+                dst.update_tags(UNITS="mg m^-3", PRED_DOMAIN="mgm3",
+                                COMMENT="Chl-a predita a partir de MODIS (two-stage); esc. 0.0001 aplicada no mosaico.")
+        return str(final)
+
+    srcs = [rio.open(p) for p in tile_tifs]
+    mosaic_arr, mosaic_trans = rio_merge(srcs)
+    for s in srcs: s.close()
+    ref = rio.open(tile_tifs[0])
+    prof = ref.profile.copy()
+    prof.update({"height": mosaic_arr.shape[1], "width": mosaic_arr.shape[2],
+                 "transform": mosaic_trans, "count": 1, "dtype": "float32"})
+    out_path = out_dir / f"curuai_chla_{ym}.tif"
+    with rio.open(out_path, "w", **prof) as dst:
+        dst.write(mosaic_arr.astype("float32")[0], 1)
+        dst.update_tags(UNITS="mg m^-3", PRED_DOMAIN="mgm3",
+                        COMMENT="Chl-a predita a partir de MODIS (two-stage); esc. 0.0001 aplicada no mosaico.")
+    ref.close()
+    return str(out_path)
+
+# Loop principal
+all_months = months_between(START_YM, END_YM)
+print(f"\n🚀 INICIANDO PROCESSAMENTO | Período: {START_YM}–{END_YM}  ROI:{ROI_BOUNDS}")
+for ym in tqdm(all_months):
+    y1, y2 = ym_to_dates(ym)
+    # 1) imagem de features (mesma ORDEM do modelo)
+    feat_img = build_feature_image(ym, model_features)
+
+    # 2) export por tiles
+    tile_paths = []
+    print(f"\n--- {ym} ---")
+    # contagem imagens só pra log
+    nimgs = (ee.ImageCollection('MODIS/006/MOD09GA')
+             .filterDate(y1, y2).filterBounds(ROI).size().getInfo())
+    print(f"  MODIS: {nimgs} imagens (limite {TILES_NX*TILES_NY*5})")
+    for tix, tile in enumerate(TILES, start=1):
+        tif_path = FEAT_DIR / f"curuai_feats_{ym}_tile{tix}.tif"
+        if not tif_path.exists():
+            try:
+                ee_export_tif(feat_img, tile, SCALE, CRS, str(tif_path))
+            except Exception as e:
+                print(f"    ✗ tile {tix} erro export: {e}")
+                continue
+        print(f"    ✓ feat tile {tix}/{len(TILES)}")
+        tile_paths.append(str(tif_path))
+
+    # 3) predição por tile (inversa aplicada ANTES de escrever)
+    pred_tiles = []
+    ok_count = 0
+    for tix, fpath in enumerate(tile_paths, start=1):
+        try:
+            with rio.open(fpath) as ds:
+                X, (nr, nc) = raster_to_X(ds)
+                # NaN/Inf -> 0
+                X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+                yhat_log = predict_two_stage(X)
+                yhat = np.expm1(yhat_log)  # ← inversa (mg/m³)
+                yhat[yhat < 0] = 0
+                Y = yhat.reshape(nr, nc)
+            out_tile = PRED_TDIR / f"curuai_chla_{ym}_tile{tix}.tif"
+            write_geotiff_like(fpath, out_tile, Y, nodata=np.nan,
+                               tags={"UNITS":"mg m^-3","PRED_DOMAIN":"mgm3",
+                                     "COMMENT":"Two-stage; inversa aplicada; fonte: MOD09GA; scale 0.0001 nas Rrs"})
+            pred_tiles.append(str(out_tile))
+            ok_count += 1
+        except Exception as e:
+            print(f"    ✗ erro predict tile {tix}: {e}")
+    print(f"  🧠 predição por tile  ✓ {ok_count}/{len(tile_paths)} tiles")
+
+    # 4) mosaico mensal final
+    if ok_count > 0:
+        final_path = mosaic_month(ym, pred_tiles, out_dir=PRED_DIR)
+        print("  📦 mosaico:", final_path)
+    else:
+        print("  ⚠ sem tiles válidos neste mês; pulando mosaico.")
+
+# ----------------------------
+# Série temporal (mg/m³) + gráfico
+# ----------------------------
+def ym_from_path(p):
+    m = re.search(r"(\d{4})-(\d{2})", os.path.basename(p))
+    return f"{m.group(1)}-{m.group(2)}" if m else None
+
+files = sorted(glob.glob(str(PRED_DIR / "curuai_chla_*.tif")))
+rows = []
+for f in files:
+    with rio.open(f) as ds:
+        a = ds.read(1, masked=True)
+        a = np.ma.masked_invalid(a)
+        a = np.ma.masked_less(a, 0)
+        if a.count() == 0:
+            continue
+        rows.append({
+            "ym": ym_from_path(f),
+            "mean_chla_mg_m3": float(a.mean()),
+            "median_chla_mg_m3": float(np.ma.median(a)),
+            "p90_chla_mg_m3": float(np.nanpercentile(a.compressed(), 90))
+        })
+
+ts = pd.DataFrame(rows).set_index("ym").sort_index()
+csv_out = OUTROOT / "summary_timeseries.csv"
+ts.to_csv(csv_out, index=True)
+print("\nCSV salvo em", csv_out)
+
+# gráfico simples
+if len(ts):
+    plt.figure(figsize=(12,4))
+    ts["median_chla_mg_m3"].plot()
+    plt.title("Clorofila-a mediana mensal (ROI) — mg/m³")
+    plt.xlabel("Mês"); plt.ylabel("Chl-a (mg/m³)")
+    plt.grid(True, alpha=.3); plt.tight_layout(); plt.show()
+else:
+    print("Sem dados para plotar (verifique meses válidos).")
