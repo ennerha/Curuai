@@ -1,0 +1,502 @@
+# ============================================================
+# Lago Curuai — benchmark multimodelos + estratégia por faixa
+# - QA com flags.csv/xlsx
+# - features espectrais + seleção (Permutation Importance)
+# - modelos globais e por-faixa (two-stage)
+# - SVR com Optuna
+# - métricas e ranking
+# ============================================================
+
+!pip -q install optuna xgboost lightgbm
+
+import warnings, os, re, unicodedata, json
+warnings.filterwarnings("ignore")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pathlib import Path
+
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.metrics import (r2_score, mean_squared_error, mean_absolute_error,
+                             mean_absolute_percentage_error, accuracy_score)
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.inspection import permutation_importance
+
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV, ElasticNetCV
+from sklearn.cross_decomposition import PLSRegression
+from sklearn.svm import SVR, SVC
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from xgboost import XGBRegressor, XGBClassifier
+from lightgbm import LGBMRegressor, LGBMClassifier
+
+import optuna, joblib
+
+# ----------------------------
+# Config
+# ----------------------------
+RRSPATH   = "rrs.xlsx"       # subir
+STPATH    = "stations.xlsx"  # subir (aba "Data")
+FLAGSPATH = "flags.csv"      # opcional: "flags.csv" ou "flags.xlsx"
+OUTDIR    = Path("artifacts_curuai"); OUTDIR.mkdir(exist_ok=True)
+
+USE_QA_FLAGS     = True
+TOP_K_FEATURES   = 25        # nº máximo de features após seleção
+N_TRIALS_OPTUNA  = 60        # SVR tuning
+RANDOM_STATE     = 42
+
+# pesos por faixa (para modelos globais)
+W_LOW, W_MID, W_HIGH = 1.2, 1.0, 1.5
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def normalize_strong(s: str) -> str:
+    s = str(s or "").lower()
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+    s = re.sub(r'[^a-z0-9]', '', s)
+    return s
+
+def rmse(y_true, y_pred): return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def safe_ratio(a, b):
+    a = a.astype(float); b = b.astype(float)
+    den = a + b; den[den == 0] = np.nan
+    return (a - b) / den
+
+def first_derivative(df_bands):
+    cols = sorted(df_bands.columns, key=lambda c: int(c.split("_")[1]))
+    arr = df_bands[cols].values
+    d1 = np.diff(arr, axis=1)
+    return {"d1_mean": np.nanmean(d1, axis=1), "d1_p95": np.nanpercentile(d1, 95, axis=1)}
+
+def second_derivative(df_bands):
+    cols = sorted(df_bands.columns, key=lambda c: int(c.split("_")[1]))
+    arr = df_bands[cols].values
+    d2 = np.diff(arr, n=2, axis=1)
+    return {"d2_mean": np.nanmean(d2, axis=1), "d2_p95": np.nanpercentile(d2, 95, axis=1)}
+
+def window_sum(df_bands, lmin, lmax, band_core):
+    cols = [c for c in df_bands.columns if c.startswith("Rrs_") and c in band_core and lmin <= int(c.split("_")[1]) <= lmax]
+    if len(cols) == 0: return np.full(len(df_bands), np.nan)
+    return df_bands[cols].sum(axis=1)
+
+def load_flags(path):
+    p = Path(path)
+    if not p.exists(): return None
+    if p.suffix.lower() == ".csv":
+        return pd.read_csv(p)
+    else:
+        return pd.read_excel(p)
+
+def pick_groups(d):
+    if "date" in d.columns:
+        ddate = pd.to_datetime(d["date"], errors="coerce")
+        if ddate.notna().sum() > 0:
+            g = ddate.dt.date.astype(str)
+            if pd.Series(g).nunique() >= 3: return g.values
+    idx = d.reset_index().index
+    return (idx // max(1, len(d)//5)).astype(str)
+
+def metrics_from_log(obs_log, pred_log):
+    r2_log = r2_score(obs_log, pred_log)
+    rmse_log = np.sqrt(mean_squared_error(obs_log, pred_log))
+    # clipping para espaço original
+    lo, hi = np.nanpercentile(obs_log, [0.5, 99.5])
+    pred_log = np.clip(pred_log, lo-0.25, hi+0.25)
+    obs, pred = np.expm1(obs_log), np.expm1(pred_log)
+    m = np.isfinite(obs) & np.isfinite(pred)
+    return dict(
+        R2_log1p = float(r2_log),
+        RMSE_log1p = float(rmse_log),
+        RMSE = rmse(obs[m], pred[m]),
+        MAE  = mean_absolute_error(obs[m], pred[m]),
+        MAPE = mean_absolute_percentage_error(obs[m], pred[m])
+    )
+
+def report_df(rows):
+    df = pd.DataFrame(rows)
+    order = ["Model","Strategy","R2_log1p","RMSE_log1p","RMSE","MAE","MAPE","Notes"]
+    for c in order:
+        if c not in df.columns: df[c] = np.nan
+    return df[order].sort_values(["Strategy","R2_log1p"], ascending=[True, False])
+
+# ----------------------------
+# Carregamento e filtro Curuai
+# ----------------------------
+assert Path(RRSPATH).exists() and Path(STPATH).exists(), "Suba rrs.xlsx e stations.xlsx."
+rrs = pd.read_excel(RRSPATH)
+sta = pd.read_excel(STPATH, sheet_name="Data")
+
+band_cols_all = [c for c in rrs.columns if c.startswith("Rrs_")]
+wanted = [443,490,510,560,620,665,681,700,705,708,709]
+band_core = [f"Rrs_{b}" for b in wanted if f"Rrs_{b}" in band_cols_all]
+if not band_core: band_core = band_cols_all
+
+sta_cols = [c for c in ["BR_ID","lake_name","chla_ugL","date"] if c in sta.columns]
+df = rrs[["BR_ID"] + band_core].merge(sta[sta_cols], on="BR_ID", how="inner")
+
+# Apenas Curuai
+norm_name = df["lake_name"].map(normalize_strong)
+mask_curuai = norm_name.str.contains("curuai", regex=False)
+print(f"Amostras totais (merge): {len(df)}")
+df = df.loc[mask_curuai].copy()
+print(f"Amostras Curuai: {len(df)}")
+df = df.dropna(subset=["chla_ugL"]).copy()
+
+# QA por flags
+if USE_QA_FLAGS and FLAGSPATH is not None and Path(FLAGSPATH).exists():
+    flags = load_flags(FLAGSPATH)
+    if flags is not None and "BR_ID" in flags.columns:
+        dff = df.merge(flags, on="BR_ID", how="left", suffixes=("","_flag"))
+        # QWIP ±0.2
+        qwi_cols = [c for c in dff.columns if 'qwi' in c.lower()]
+        mask_qwi_bad = False
+        for c in qwi_cols:
+            x = pd.to_numeric(dff[c], errors="coerce")
+            if x.notna().any():
+                bad = (x < -0.2) | (x > 0.2)
+                mask_qwi_bad = bad if isinstance(mask_qwi_bad, bool) else (mask_qwi_bad | bad)
+        # outras flags
+        pat_bad = re.compile(r'(negative|susp|baseline|oxygen|noisy)', re.I)
+        bad_cols = [c for c in dff.columns if pat_bad.search(c)]
+        mask_misc_bad = False
+        for c in bad_cols:
+            v = dff[c]
+            if v.dtype == bool:
+                bad = v
+            else:
+                bad = pd.to_numeric(v, errors="coerce").fillna(0) > 0
+            mask_misc_bad = bad if isinstance(mask_misc_bad, bool) else (mask_misc_bad | bad)
+        drop_mask = (mask_qwi_bad if not isinstance(mask_qwi_bad, bool) else False) | \
+                    (mask_misc_bad if not isinstance(mask_misc_bad, bool) else False)
+        n_before = len(df)
+        df = dff.loc[~drop_mask, df.columns].copy()
+        print(f"Filtro flags: removidas {n_before - len(df)} amostras.")
+    else:
+        print("flags vazio/sem BR_ID — ignorando QA.")
+else:
+    if USE_QA_FLAGS:
+        print("flags não encontrado — seguindo sem QA por flags.")
+
+# exigir >= 6 bandas; imputar mediana
+min_bands_required = min(6, len(band_core))
+valid = df[band_core].notna().sum(axis=1) >= min_bands_required
+print(f"Amostras com >= {min_bands_required} bandas: {int(valid.sum())}/{len(df)}")
+df = df.loc[valid].copy()
+for b in band_core:
+    df[b] = df[b].fillna(df[b].median())
+
+# ----------------------------
+# Engenharia espectral
+# ----------------------------
+B = df[band_core].copy()
+F = B.copy()
+if "Rrs_560" in B.columns:
+    for c in B.columns: F[c+"_norm560"] = B[c] / (B["Rrs_560"] + 1e-12)
+F["norm_Rrs_L1"] = B.sum(axis=1) + 1e-12
+for c in B.columns: F[c+"_normL1"] = B[c] / F["norm_Rrs_L1"]
+
+# índices relevantes
+if {"Rrs_708","Rrs_665"}.issubset(B.columns): F["NDCI"] = safe_ratio(B["Rrs_708"], B["Rrs_665"])
+if {"Rrs_681","Rrs_665"}.issubset(B.columns): F["Red_a"] = safe_ratio(B["Rrs_681"], B["Rrs_665"])
+if {"Rrs_560","Rrs_490"}.issubset(B.columns): F["G_over_B"] = B["Rrs_560"] / (B["Rrs_490"] + 1e-12)
+if {"Rrs_490","Rrs_665"}.issubset(B.columns): F["B_over_R"] = B["Rrs_490"] / (B["Rrs_665"] + 1e-12)
+if {"Rrs_709","Rrs_681"}.issubset(B.columns): F["RedEdgeSlope"] = B["Rrs_709"] - B["Rrs_681"]
+if {"Rrs_700","Rrs_665"}.issubset(B.columns): F["RedPeakMinusR"] = B["Rrs_700"] - B["Rrs_665"]
+if {"Rrs_705","Rrs_681"}.issubset(B.columns): F["Slope_681_705"] = B["Rrs_705"] - B["Rrs_681"]
+
+F["Area_Blue"]  = window_sum(B, 440, 500, band_core)
+F["Area_Green"] = window_sum(B, 520, 580, band_core)
+F["Area_Red"]   = window_sum(B, 650, 700, band_core)
+F["Area_RE"]    = window_sum(B, 700, 710, band_core)
+
+d1 = first_derivative(B); d2 = second_derivative(B)
+for k,v in d1.items(): F[k] = v
+for k,v in d2.items(): F[k] = v
+
+F = F.replace([np.inf,-np.inf], np.nan)
+for c in F.columns: F[c] = F[c].fillna(F[c].median())
+
+feature_names_all = F.columns.tolist()
+X_all = F.values
+y_log = np.log1p(df["chla_ugL"].astype(float)).values
+y_lin = np.expm1(y_log)
+
+# grupos por data
+groups = pick_groups(df)
+n_groups = pd.Series(groups).nunique()
+n_splits = max(2, min(5, n_groups))
+print(f"n_grupos={n_groups}, n_splits={n_splits}")
+gkf = GroupKFold(n_splits=n_splits)
+
+# ----------------------------
+# Seleção de features (Permutation Importance com RF)
+# ----------------------------
+importances = np.zeros(len(feature_names_all))
+rf_tmp = RandomForestRegressor(n_estimators=600, min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1)
+
+for tr, te in gkf.split(X_all, y_log, groups):
+    rf_tmp.fit(X_all[tr], y_log[tr])
+    pi = permutation_importance(rf_tmp, X_all[te], y_log[te], n_repeats=5, random_state=RANDOM_STATE, n_jobs=-1)
+    importances += pi.importances_mean
+
+importances /= n_splits
+imp_df = pd.DataFrame({"feature": feature_names_all, "importance": importances}).sort_values("importance", ascending=False)
+imp_df.to_csv(OUTDIR / "curuai_permutation_importance.csv", index=False)
+
+top_features = imp_df.head(min(TOP_K_FEATURES, len(imp_df))).query("importance > 0")["feature"].tolist()
+if len(top_features) < 10:
+    top_features = imp_df.head(12)["feature"].tolist()
+
+X = F[top_features].values
+print(f"Selecionadas {len(top_features)} features.")
+
+# ----------------------------
+# Pesos por faixa (para modelos globais)
+# ----------------------------
+bins_lin = pd.Series(pd.cut(y_lin, bins=[-np.inf, 20, 100, np.inf], labels=["low","mid","high"]))
+w_map = {"low":W_LOW, "mid":W_MID, "high":W_HIGH}
+weights_all = bins_lin.map(w_map).astype(float).fillna(1.0).to_numpy()
+
+# ----------------------------
+# Otimização SVR (global)
+# ----------------------------
+def svr_objective(trial):
+    C = trial.suggest_float("C", 1e-1, 1e3, log=True)
+    gamma = trial.suggest_float("gamma", 1e-4, 1e0, log=True)
+    eps = trial.suggest_float("epsilon", 1e-3, 0.5, log=True)
+    pipe = Pipeline([
+        ("qt", QuantileTransformer(output_distribution="normal", random_state=RANDOM_STATE)),
+        ("svr", SVR(kernel="rbf", C=C, gamma=gamma, epsilon=eps))
+    ])
+    scores = []
+    for tr, te in gkf.split(X, y_log, groups):
+        pipe.fit(X[tr], y_log[tr], svr__sample_weight=weights_all[tr])
+        yhat = pipe.predict(X[te])
+        scores.append(r2_score(y_log[te], yhat))
+    return float(np.mean(scores))
+
+study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+study.optimize(svr_objective, n_trials=N_TRIALS_OPTUNA, show_progress_bar=False)
+best_svr_params = study.best_params
+print("Melhores hiperparâmetros SVR (global):", best_svr_params)
+
+SVR_GLOBAL = Pipeline([
+    ("qt", QuantileTransformer(output_distribution="normal", random_state=RANDOM_STATE)),
+    ("svr", SVR(kernel="rbf", **best_svr_params))
+])
+
+# ----------------------------
+# Modelos globais (benchmark)
+# ----------------------------
+models_global = {
+    "Linear": Pipeline([("lr", LinearRegression())]),
+    "RidgeCV": Pipeline([("ridge", RidgeCV(alphas=np.logspace(-3,3,25)))]),
+    "LassoCV": Pipeline([("lasso", LassoCV(cv=5, random_state=RANDOM_STATE, n_alphas=50, max_iter=5000))]),
+    "ElasticNetCV": Pipeline([("enet", ElasticNetCV(cv=5, random_state=RANDOM_STATE, n_alphas=50, l1_ratio=[.1,.3,.5,.7,.9], max_iter=5000))]),
+    "PLS5": Pipeline([("pls", PLSRegression(n_components=min(5, X.shape[1])))]),
+    "KNN": Pipeline([("sc", StandardScaler()), ("knn", KNeighborsRegressor(n_neighbors=7, weights="distance"))]),
+    "SVR_Optuna": SVR_GLOBAL,
+    "RandomForest": Pipeline([("rf", RandomForestRegressor(n_estimators=800, min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1))]),
+    "XGBoost": Pipeline([("xgb", XGBRegressor(n_estimators=1200, max_depth=6, subsample=0.9, colsample_bytree=0.9,
+                                              learning_rate=0.03, reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1, tree_method="hist"))]),
+    "LightGBM": Pipeline([("lgb", LGBMRegressor(n_estimators=1400, learning_rate=0.03, max_depth=-1, num_leaves=64,
+                                                subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1))]),
+    "MLP": Pipeline([("sc", StandardScaler()), ("mlp", MLPRegressor(hidden_layer_sizes=(128,64), activation="relu",
+                                                                    alpha=1e-3, learning_rate_init=5e-3,
+                                                                    batch_size=64, max_iter=600, random_state=RANDOM_STATE))])
+}
+
+# ----------------------------
+# Avaliação — Globais (holdout único + CV texto)
+# ----------------------------
+gss = GroupShuffleSplit(n_splits=1, train_size=0.8, random_state=RANDOM_STATE)
+tr, te = next(gss.split(X, y_log, groups))
+rows = []
+
+for name, model in models_global.items():
+    # fit global com pesos (quando possível)
+    try:
+        model.fit(X[tr], y_log[tr], **({} if "svr" not in str(model) else {"svr__sample_weight": weights_all[tr]}))
+    except:
+        model.fit(X[tr], y_log[tr])
+
+    yhat = model.predict(X[te])
+    # métricas holdout
+    m_hold = metrics_from_log(y_log[te], yhat)
+    rows.append(dict(Model=name, Strategy="Global", **m_hold, Notes="holdout"))
+
+global_table = report_df(rows)
+print("\n==== Métricas Globais (holdout) ====")
+print(global_table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+best_global = global_table.sort_values("R2_log1p", ascending=False).iloc[0]
+print(f"\n>>> Melhor modelo GLOBAL por R2_log1p: {best_global['Model']}")
+
+# ----------------------------
+# Estratégia Por Faixa (two-stage)
+# - Classificador: <20 vs ≥20 µg/L
+# - Regressor especializado para cada faixa
+# ----------------------------
+y_class = (y_lin >= 20).astype(int)  # 0: <20; 1: >=20
+
+cls_candidates = {
+    "RFC": RandomForestClassifier(n_estimators=500, max_depth=None, random_state=RANDOM_STATE, n_jobs=-1),
+    "XGBc": XGBClassifier(n_estimators=600, max_depth=5, learning_rate=0.05, subsample=0.9, colsample_bytree=0.9,
+                          reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1, tree_method="hist"),
+    "LGBMc": LGBMClassifier(n_estimators=700, learning_rate=0.05, num_leaves=63, subsample=0.9, colsample_bytree=0.9,
+                            reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1)
+}
+# Escolhe classificador por CV rápida (acurácia)
+acc_best, cls_best_name, CLS_BEST = -1, None, None
+for cname, cls in cls_candidates.items():
+    accs = []
+    for trc, tec in gkf.split(X, y_class, groups):
+        cls.fit(X[trc], y_class[trc])
+        accs.append(accuracy_score(y_class[tec], cls.predict(X[tec])))
+    acc = float(np.mean(accs))
+    if acc > acc_best: acc_best, cls_best_name, CLS_BEST = acc, cname, cls
+print(f"\nClassificador por faixa escolhido: {cls_best_name} (acc CV={acc_best:.3f})")
+
+# Regressor por faixa (escolhemos 3 candidatos e pegamos o melhor por CV em cada faixa)
+reg_candidates = {
+    "SVR": Pipeline([("qt", QuantileTransformer(output_distribution="normal", random_state=RANDOM_STATE)),
+                     ("svr", SVR(kernel="rbf", C=best_svr_params["C"], gamma=best_svr_params["gamma"], epsilon=best_svr_params["epsilon"]))]),
+    "RF": RandomForestRegressor(n_estimators=800, min_samples_leaf=2, random_state=RANDOM_STATE, n_jobs=-1),
+    "LGBM": LGBMRegressor(n_estimators=1200, learning_rate=0.03, num_leaves=64, subsample=0.85, colsample_bytree=0.85,
+                          reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1)
+}
+
+def pick_best_regressor(mask, label):
+    Xa, ya = X[mask], y_log[mask]
+    best_r2, best_name, best_model = -1e9, None, None
+    for rname, rmodel in reg_candidates.items():
+        scores = []
+        for trf, tef in gkf.split(Xa, ya, groups[mask]):
+            try:
+                if rname == "SVR":
+                    rmodel.fit(Xa[trf], ya[trf])  # SVR sem peso por faixa aqui
+                else:
+                    rmodel.fit(Xa[trf], ya[trf])
+                yhat = rmodel.predict(Xa[tef])
+                scores.append(r2_score(ya[tef], yhat))
+            except Exception as e:
+                scores.append(-1e9)
+        s = float(np.mean(scores))
+        if s > best_r2: best_r2, best_name, best_model = s, rname, rmodel
+    print(f"Melhor regressor para faixa '{label}': {best_name} (R2_log1p CV={best_r2:.3f})")
+    return best_name, best_model
+
+mask_low  = (y_lin < 20)
+mask_high = ~mask_low  # >=20
+
+low_name,  LOW_REG  = pick_best_regressor(mask_low,  "<20")
+high_name, HIGH_REG = pick_best_regressor(mask_high, "≥20")
+
+# Holdout two-stage
+tr, te = next(gss.split(X, y_log, groups))
+
+CLS_BEST.fit(X[tr], y_class[tr])
+pred_class = CLS_BEST.predict(X[te]).astype(int)
+
+# treina regressões especializadas
+LOW_REG.fit(X[tr][y_class[tr]==0],  y_log[tr][y_class[tr]==0])
+HIGH_REG.fit(X[tr][y_class[tr]==1], y_log[tr][y_class[tr]==1])
+
+# aplica por faixa prevista
+yhat_log_two = np.empty_like(y_log[te]); yhat_log_two[:] = np.nan
+mask_pred_low  = (pred_class == 0)
+mask_pred_high = (pred_class == 1)
+yhat_log_two[mask_pred_low]  = LOW_REG.predict (X[te][mask_pred_low])
+yhat_log_two[mask_pred_high] = HIGH_REG.predict(X[te][mask_pred_high])
+
+two_stage_metrics = metrics_from_log(y_log[te], yhat_log_two)
+row_two = dict(Model=f"TwoStage[{cls_best_name}->{low_name}/{high_name}]",
+               Strategy="By-Range", **two_stage_metrics, Notes="holdout")
+print("\n==== Estratégia por Faixa (holdout) ====")
+for k,v in two_stage_metrics.items():
+    print(f"{k}: {v:.3f}")
+
+# Métricas por faixa no holdout (para two-stage)
+obs_lin_hold = np.expm1(y_log[te])
+pred_lin_hold = np.expm1(yhat_log_two)
+bins_te = pd.Series(pd.cut(obs_lin_hold, bins=[-np.inf, 20, 100, np.inf], labels=["<20","20–100",">100"]))
+
+def metrics_bin(y_true, y_pred, label):
+    m = dict(Bin=label, n=int(len(y_true)))
+    m["RMSE"] = rmse(y_true, y_pred)
+    m["MAE"]  = mean_absolute_error(y_true, y_pred)
+    m["MAPE"] = mean_absolute_percentage_error(y_true, y_pred)
+    return m
+
+bin_rows = []
+for bl in ["<20","20–100",">100"]:
+    m = (bins_te == bl).to_numpy()
+    if m.sum() > 0:
+        bin_rows.append(metrics_bin(obs_lin_hold[m], pred_lin_hold[m], bl))
+bin_df = pd.DataFrame(bin_rows)
+print("\nMétricas por faixa (holdout, two-stage):")
+print(bin_df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+# ----------------------------
+# Consolidação (ranking final)
+# ----------------------------
+final_table = pd.concat([global_table, report_df([row_two])], ignore_index=True)
+print("\n==== Tabela consolidada (holdout) ====")
+print(final_table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+best_overall = final_table.sort_values("R2_log1p", ascending=False).iloc[0]
+print(f"\n>>> MELHOR GERAL: {best_overall['Model']} [{best_overall['Strategy']}] — R2_log1p={best_overall['R2_log1p']:.3f}, RMSE={best_overall['RMSE']:.2f}, MAE={best_overall['MAE']:.2f}")
+
+# ----------------------------
+# Gráfico obs vs pred (melhor modelo)
+# ----------------------------
+# escolhe yhat do melhor
+if best_overall["Strategy"] == "Global":
+    best_model = models_global[best_overall["Model"]]
+    try:
+        best_model.fit(X[tr], y_log[tr], **({} if "svr" not in str(best_model) else {"svr__sample_weight": weights_all[tr]}))
+    except:
+        best_model.fit(X[tr], y_log[tr])
+    yhat_best = best_model.predict(X[te])
+else:
+    yhat_best = yhat_log_two
+
+# plot
+obs = np.expm1(y_log[te]); pred = np.expm1(yhat_best)
+plt.figure(figsize=(6.6,6.2))
+plt.scatter(obs, pred, s=18, alpha=0.7, edgecolors='none')
+low = float(min(obs.min(), pred.min())); high = float(max(obs.max(), pred.max()))
+plt.plot([low,high],[low,high],'--',color='k',linewidth=1.5,alpha=0.8)
+plt.xscale("log"); plt.yscale("log")
+plt.xlabel("Chl-a observado (µg/L)")
+plt.ylabel("Chl-a previsto (µg/L)")
+plt.title(f"Curuai — Melhor: {best_overall['Model']} [{best_overall['Strategy']}]\nR2_log1p={best_overall['R2_log1p']:.3f} | RMSE={best_overall['RMSE']:.1f} | MAE={best_overall['MAE']:.1f}")
+plt.tight_layout()
+plt.savefig(OUTDIR / "curuai_best_scatter.png", dpi=160, bbox_inches='tight')
+plt.show()
+
+# ----------------------------
+# Salvar artefatos
+# ----------------------------
+final_table.to_csv(OUTDIR / "curuai_metrics_holdout_all.csv", index=False)
+bin_df.to_csv(OUTDIR / "curuai_two_stage_holdout_bins.csv", index=False)
+imp_df.to_csv(OUTDIR / "curuai_permutation_importance.csv", index=False)
+pd.DataFrame({"feature": top_features}).to_csv(OUTDIR / "curuai_selected_features.csv", index=False)
+
+# salva modelos principais
+joblib.dump({"model": SVR_GLOBAL, "features": top_features, "params": best_svr_params}, OUTDIR / "curuai_svr_global.pkl")
+
+joblib.dump({
+    "classifier": CLS_BEST,
+    "low_regressor_name": low_name, "low_regressor": LOW_REG,
+    "high_regressor_name": high_name, "high_regressor": HIGH_REG,
+    "features": top_features
+}, OUTDIR / "curuai_two_stage.pkl")
+
+print("\nArtefatos salvos em:", OUTDIR)
+for f in ["curuai_metrics_holdout_all.csv","curuai_two_stage_holdout_bins.csv","curuai_permutation_importance.csv","curuai_selected_features.csv","curuai_svr_global.pkl","curuai_two_stage.pkl","curuai_best_scatter.png"]:
+    p = OUTDIR / f
+    if p.exists(): print(" -", p)
