@@ -38,6 +38,8 @@ for pkg, imp in [("rasterio>=1.3.9","rasterio"), ("earthengine-api>=1.0.0","ee")
 import rasterio as rio
 from rasterio.merge import merge as rio_merge
 import joblib
+import matplotlib
+matplotlib.use("Agg")  # evita depender do JS do notebook
 import matplotlib.pyplot as plt
 # tqdm: fallback para barras ASCII quando JS não carrega o output (Colab)
 try:
@@ -126,6 +128,12 @@ DIR_FEATS = ART / "features"
 DIR_PRED  = ART / "pred"
 for d in [ART, DIR_FEATS, DIR_PRED]:
     d.mkdir(parents=True, exist_ok=True)
+
+# Saída de gráficos
+SAVE_PLOTS = True
+SHOW_INLINE_PLOTS = False  # False: não chama plt.show(); salva PNGs em disco
+PLOT_DIR = ART / "plots"
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Caminhos dos modelos/artefatos
 P_TWO_STAGE = "/content/artifacts_curuai/curuai_two_stage.pkl"
@@ -849,8 +857,8 @@ def main():
         pbar_months.close()
 
     # ----------------------------
-    # SALVAR CSVs E GRÁFICOS
-    # ----------------------------
+# SALVAR CSVs E GRÁFICOS
+# ----------------------------
     try:
         pd.DataFrame(counts).to_csv(COUNT_CSV, index=False)
     except Exception as e:
@@ -867,13 +875,24 @@ def main():
         ts = pd.DataFrame(columns=["mean_chla"])
 
     try:
+        # --- Série temporal ---
         if not ts.empty:
             plt.figure(figsize=(14, 5))
             plt.plot(ts.index, ts["mean_chla"], lw=1.5, marker='o', markersize=3)
             plt.title("Clorofila-a média mensal (ROI Curuai) — mg/m³", fontsize=14)
             plt.xlabel("Mês"); plt.ylabel("Chl-a (mg/m³)")
-            plt.xticks(rotation=45); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
-        cnt = pd.read_csv(COUNT_CSV)
+            plt.xticks(rotation=45); plt.grid(True, alpha=0.3); plt.tight_layout()
+            if SAVE_PLOTS:
+                plt.savefig(PLOT_DIR / "timeseries_chla.png", dpi=150, bbox_inches="tight")
+            if SHOW_INLINE_PLOTS:
+                plt.show()
+            plt.close()
+
+        # --- Contagem média por mês do ano ---
+        try:
+            cnt = pd.read_csv(COUNT_CSV)
+        except Exception:
+            cnt = pd.DataFrame()
         if not cnt.empty:
             cnt["year"] = pd.to_numeric(cnt["ym"].str.slice(0,4), errors="coerce")
             cnt["month"] = pd.to_numeric(cnt["ym"].str.slice(5,7), errors="coerce")
@@ -886,21 +905,32 @@ def main():
                 plt.xticks(range(1,13), ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'])
                 plt.xlabel("Mês do ano"); plt.ylabel("Nº de imagens")
                 plt.title(f"MODIS — Quantidade de imagens por mês (média {START_YEAR}–{END_YEAR})")
-                plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout(); plt.show()
-                # --- Boxplot por mês do ano (2001–2024) ---
-                if not ts.empty:
-                    ts_box = ts.reset_index().copy()
-                    ts_box["year"] = pd.to_numeric(ts_box["ym"].str.slice(0,4), errors="coerce")
-                    ts_box["month"] = pd.to_numeric(ts_box["ym"].str.slice(5,7), errors="coerce")
-                    ts_box = ts_box.dropna(subset=["month"]).copy()
-                    data = [ts_box.loc[ts_box["month"]==m, "mean_chla"].dropna().values for m in range(1,13)]
-                    if any(len(d)>0 for d in data):
-                        plt.figure(figsize=(12,5))
-                        plt.boxplot(data, labels=['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'], showmeans=True)
-                        plt.ylabel("Chl-a (mg/m³)")
-                        plt.title(f"Clorofila-a — distribuição por mês do ano ({START_YEAR}–{END_YEAR})")
-                        plt.grid(True, axis='y', alpha=0.3)
-                        plt.tight_layout(); plt.show()
+                plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+                if SAVE_PLOTS:
+                    plt.savefig(PLOT_DIR / "counts_by_month.png", dpi=150, bbox_inches="tight")
+                if SHOW_INLINE_PLOTS:
+                    plt.show()
+                plt.close()
+
+        # --- Boxplot por mês do ano (2001–2024) ---
+        if not ts.empty:
+            ts_box = ts.reset_index().copy()
+            ts_box["year"] = pd.to_numeric(ts_box["ym"].str.slice(0,4), errors="coerce")
+            ts_box["month"] = pd.to_numeric(ts_box["ym"].str.slice(5,7), errors="coerce")
+            ts_box = ts_box.dropna(subset=["month"]).copy()
+            data = [ts_box.loc[ts_box["month"]==m, "mean_chla"].dropna().values for m in range(1,13)]
+            if any(len(d)>0 for d in data):
+                plt.figure(figsize=(12,5))
+                plt.boxplot(data, labels=['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'], showmeans=True)
+                plt.ylabel("Chl-a (mg/m³)")
+                plt.title(f"Clorofila-a — distribuição por mês do ano ({START_YEAR}–{END_YEAR})")
+                plt.grid(True, axis='y', alpha=0.3)
+                plt.tight_layout()
+                if SAVE_PLOTS:
+                    plt.savefig(PLOT_DIR / "boxplot_chla_by_month.png", dpi=150, bbox_inches="tight")
+                if SHOW_INLINE_PLOTS:
+                    plt.show()
+                plt.close()
     except Exception as e:
         tqdm.write(f"Erro ao gerar gráficos: {e}")
 
@@ -909,8 +939,12 @@ def main():
         total_months = (END_YEAR - START_YEAR + 1) * 12
         meses_com_dado = len(ts_rows)
         tqdm.write(f"Concluído. Meses com dados: {meses_com_dado}/{total_months}. Saídas: {ART}")
+        if SAVE_PLOTS:
+            tqdm.write(f"Gráficos salvos em: {PLOT_DIR}")
     except Exception:
         pass
 
 if __name__ == "__main__":
+    main()
+
     main()
