@@ -1,479 +1,186 @@
 # ============================================================
-# APLICAÇÃO MODELO CURUAI (MODIS SR) — VERSÃO COM PROGRESSO
-# - Sem avisos verbosos (VERBOSE=False)
-# - Barras de progresso (tqdm) para meses, tiles e downloads
-# - Máscara QA (nuvem/sombra + MODLAND good/marginal)
-# - Escala 0.0001 antes do mosaico (mesma do treino)
-# - Rankeamento por qualidade opcional (top-N)
-# - Tiles 4x4, exporta features, prevê two-stage, salva rasters
-# - Série temporal & gráficos (Colab)
-# - Boxplot por mês do ano (2001–2024)
+# CURUAI (MODIS SR) — Aplicação do modelo (todos os anos)
+# One-shot por mês (sem tiles) + recorte exato pelo shapefile
+# - CRS único EPSG:4326 @ 500 m
+# - COMPOSITE: "median" (padrão) ou "mean"
+# - Inversão ln1p -> expm1
+# - Prévia PNG e quantis por mês
 # ============================================================
 
-# Se rodar num Colab limpo, descomente a linha abaixo:
-# !pip -q install earthengine-api geemap rasterio joblib numpy pandas matplotlib tqdm
+# !pip -q install earthengine-api rasterio joblib numpy pandas matplotlib geopandas shapely fiona pyproj requests tqdm
 
-import os, json, glob, warnings, requests
+import os, io, zipfile, warnings, requests, logging, importlib, sys, subprocess
 from pathlib import Path
-import time
-
 import numpy as np
 import pandas as pd
-import importlib, sys, subprocess
-
-# --- Bootstrap de dependências: instala pacotes ausentes no Colab ---
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 def _ensure(pkg, import_name=None):
     name = import_name or pkg.split('==')[0].split('>=')[0]
-    try:
-        importlib.import_module(name)
-    except ModuleNotFoundError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+    try: importlib.import_module(name)
+    except ModuleNotFoundError: subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-# Garante dependências essenciais
-for pkg, imp in [("rasterio>=1.3.9","rasterio"), ("earthengine-api>=1.0.0","ee"), ("geemap>=0.29.7","geemap"), ("joblib>=1.2","joblib"), ("geopandas>=0.14","geopandas"), ("shapely>=2.0","shapely"), ("fiona>=1.9","fiona"), ("pyproj>=3.5","pyproj")]:
+for pkg, imp in [
+    ("earthengine-api>=1.0.0","ee"),
+    ("rasterio>=1.3.9","rasterio"),
+    ("joblib>=1.2","joblib"),
+    ("geopandas>=0.14","geopandas"),
+    ("shapely>=2.0","shapely"),
+    ("fiona>=1.9","fiona"),
+    ("pyproj>=3.5","pyproj"),
+    ("requests>=2.31","requests"),
+    ("tqdm>=4.66","tqdm"),
+]:
     _ensure(pkg, imp)
-    _ensure(pkg, imp)
-
-import rasterio as rio
-from rasterio.merge import merge as rio_merge
-import joblib
-import matplotlib
-matplotlib.use("Agg")  # evita depender do JS do notebook
-import matplotlib.pyplot as plt
-# tqdm: fallback para barras ASCII quando JS não carrega o output (Colab)
-try:
-    if os.environ.get("FORCE_TQDM_ASCII", "0") == "1":
-        from tqdm import tqdm  # barra de texto puro (sem JS)
-    else:
-        from tqdm.auto import tqdm  # notebook/colab quando JS está ok
-except Exception:
-    from tqdm import tqdm
 
 import ee
-try:
-    import geemap
-except Exception:
-    geemap = None
+import rasterio as rio
+from rasterio.warp import transform_geom
+from rasterio.plot import plotting_extent
+from rasterio.features import rasterize
+import joblib
+import geopandas as gpd
+import fiona
+from shapely.geometry import mapping
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
-
-# Silencia avisos do Rasterio/GDAL no console (ex.: CPLE_AppDefined / Photometric ExtraSamples)
-import logging
 os.environ.setdefault("CPL_DEBUG", "OFF")
-for _name in ("rasterio", "rasterio._env"):
-    logging.getLogger(_name).setLevel(logging.ERROR)
-class _DropTiffReadWarning(logging.Filter):
-    def filter(self, record):
-        msg = record.getMessage()
-        if "Photometric type-related color channels and ExtraSamples" in msg:
-            return False
-        if "TIFFReadDirectory" in msg and "CPLE_AppDefined" in msg:
-            return False
-        return True
-logging.getLogger("rasterio._env").addFilter(_DropTiffReadWarning())
+os.environ.setdefault("SHAPE_RESTORE_SHX", "YES")
 
-# ----------------------------
-# CONFIGURAÇÕES
-# ----------------------------
-# Controle de verbosidade e progresso
-VERBOSE = False          # imprime mensagens detalhadas
-SHOW_PROGRESS = True     # exibe barras de progresso
-FORCE_ASCII_BARS = True  # True: força barras de texto que não dependem de JS
+# ---------------- Config ----------------
+EE_PROJECT         = os.environ.get("EE_PROJECT", "ee-enneralcantarabariri")
 
-# Ajuste de ambiente para tqdm
-if FORCE_ASCII_BARS:
-    os.environ["FORCE_TQDM_ASCII"] = "1"     # exibe barras de progresso
+SHP_PATH           = "/content/Curuai.shp"
+ROI_CRS_OVERRIDE   = None
 
-# Forçar uso de coleções 8-dias (A1) para máxima robustez
-FORCE_A1_ONLY = False     # True => ignora GA e usa sempre MOD09A1/MYD09A1
-# Se estiver usando produtos LAND em área de água, muitos pixels vêm mascarados.
-# Para garantir dados no modo 'loose', podemos remover as máscaras das bandas SR.
-FORCE_UNMASK_IN_LOOSE = True
-# Se der erro na checagem de sanidade, seguir em frente mesmo assim
-BYPASS_SANITY_ON_ERROR = True
-# Autenticação: force o fluxo interativo do GEE mesmo se houver token local
-FORCE_INTERACTIVE_AUTH = True  # mude para True se quiser abrir o login sempre
-
-# ROI (Curuai)
-ROI_BOUNDS = [-56.4, -2.55, -56.05, -2.25]   # [xmin, ymin, xmax, ymax] (fallback)
-ROI = None  # será definido após a autenticação do EE
-# Shapefile local para ROI real
-USE_SHP = True
-SHP_PATH = "/content/Curuai.shp"  # informe seu caminho .shp ou .zip
+ART       = Path("/content/artifacts_curuai_modis_only"); ART.mkdir(parents=True, exist_ok=True)
+DIR_FEATS = ART / "features"; DIR_FEATS.mkdir(exist_ok=True, parents=True)
+DIR_PRED  = ART / "pred";     DIR_PRED.mkdir(exist_ok=True, parents=True)
+PLOT_DIR  = ART / "plots";    PLOT_DIR.mkdir(exist_ok=True, parents=True)
 
 START_YEAR = 2001
 END_YEAR   = 2024
+MONTHS_FILTER = None          # ex.: [3,6,9,12] para testar só equinócios/solstícios
 
-SCALE_M = 500                 # MODIS SR GA (500 m)
-SCALE_SR = 0.0001             # fator escala reflectâncias
-CRS = None                    # None => projeção nativa do MODIS (Sinusoidal)
-NX, NY = 4, 4                 # tiles 4x4 (16)
+COMPOSITE            = "median"   # "median" ou "mean"
+MASK_STRATEGY        = "loose"    # "strict" | "moderate" | "loose"
+FORCE_UNMASK_IN_LOOSE= True
 
-# Deixe None para usar TODAS; ou, p.ex., 40 pra top-40 por QA:
-TOP_BY_QA = None              # None -> sem limite; 40 -> melhores 40 por mês
+TARGET_CRS   = "EPSG:4326"
+TARGET_SCALE = 500                 # metros
 
-# Estratégia de máscara e preenchimento
-MASK_STRATEGY = "loose"      # "strict"(nuvem+QC), "moderate"(apenas QC), "loose"(sem máscara)
-RELAX_ON_EMPTY = True         # tenta relaxar a máscara por mês se mosaic sair vazio
-EXPAND_WINDOW_MONTHS = 1      # tenta [m-1, m+1] se o mês falhar      # 0 = apenas mês; >0 expande janela temporal (ex.: 1 => [m-1, m+1])
-
-# Limites seguros
-MAX_PIXELS = 1e13
-EE_TILE_SCALE = 4
-
-# Entradas/saídas
-ART = Path("/content/artifacts_curuai_modis_only")
-DIR_FEATS = ART / "features"
-DIR_PRED  = ART / "pred"
-for d in [ART, DIR_FEATS, DIR_PRED]:
-    d.mkdir(parents=True, exist_ok=True)
-
-# Saída de gráficos
-SAVE_PLOTS = True
-SHOW_INLINE_PLOTS = False  # False: não chama plt.show(); salva PNGs em disco
-PLOT_DIR = ART / "plots"
-PLOT_DIR.mkdir(parents=True, exist_ok=True)
-
-# Caminhos dos modelos/artefatos
 P_TWO_STAGE = "/content/artifacts_curuai/curuai_two_stage.pkl"
 P_SVR_GLOB  = "/content/artifacts_curuai/curuai_svr_global.pkl"
+PRED_INVERSE = "ln1p"              # treino em log1p → aplicar expm1
 
-TS_CSV = ART / "summary_timeseries.csv"
-COUNT_CSV = ART / "image_counts.csv"
+MAX_PIXELS     = 1e13
+EE_TILE_SCALE  = 4
+MAX_ERROR_M    = 100
+NODATA_PRED    = -9999.0
+VERBOSE        = True
 
-# Bandas SR MODIS (GA 500m)
-SR_BANDS = [
-    "sur_refl_b01", "sur_refl_b02", "sur_refl_b03",
-    "sur_refl_b04", "sur_refl_b05", "sur_refl_b06", "sur_refl_b07"
-]
-QA_BAND_1KM = "state_1km"
+SR_BANDS     = ["sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07"]
+QA_BAND_1KM  = "state_1km"
 QA_BAND_500M = "sur_refl_qc_500m"
 
-# ----------------------------
-# UTIL
-# ----------------------------
+def log(msg): 
+    if VERBOSE: print(msg)
 
-def log(msg: str):
-    if VERBOSE:
-        tqdm.write(msg)
-
-# ----------------------------
-# EARTH ENGINE
-# ----------------------------
-EE_PROJECT = os.environ.get("EE_PROJECT", "ee-enneralcantarabariri")
-
-def init_ee(project: str = None,
-            service_account: str = None,
-            key_path: str = None,
-            force_interactive: bool = False):
-    if project is None:
-        project = EE_PROJECT
-    # 0) Service Account, se fornecido
+# ---------------- EE init ----------------
+def init_ee():
     try:
-        if service_account and key_path:
-            creds = ee.ServiceAccountCredentials(service_account, key_path)
-            ee.Initialize(credentials=creds, project=project)
-            log(f"EE ok via service account: {service_account} @ {project}")
-            return True
-    except Exception as e:
-        log(f"[EE] Service account falhou: {e}")
-    # 1) Se forçado, abre fluxo interativo e inicializa no projeto
-    if force_interactive:
-        try:
-            ee.Authenticate(auth_mode='notebook')
-            ee.Initialize(project=project)
-            log(f"EE ok (interactive): {project}")
-            return True
-        except Exception as e:
-            tqdm.write(f"Falha na autenticação interativa EE: {str(e)[:120]}")
-            # continua para outras tentativas
-    # 2) Tenta token local
-    try:
-        ee.Initialize(project=project)
-        log(f"EE ok: {project}")
-        return True
-    except Exception as e:
-        log(f"[EE] ee.Initialize falhou: {e}")
-    # 3) Tenta via geemap (abre fluxo se preciso)
-    try:
-        if geemap is None:
-            raise RuntimeError("geemap não disponível")
-        geemap.ee_initialize(project=project, auth_mode='notebook')
-        log(f"EE ok (geemap): {project}")
-        return True
-    except Exception as e:
-        log(f"[EE] geemap.ee_initialize falhou: {e}")
-    # 4) Último recurso: fluxo nativo
-    try:
-        ee.Authenticate(auth_mode='notebook')
-        ee.Initialize(project=project)
-        log(f"EE ok (native): {project}")
-        return True
-    except Exception as e:
-        tqdm.write(f"Falha na autenticação EE: {str(e)[:120]}")
-        return False
-
-# Permite configurar via variáveis de ambiente no Colab:
-# os.environ['EE_PROJECT'] = 'ee-enneralcantarabariri'
-# os.environ['EE_SA']      = 'svc-account@ee-enneralcantarabariri.iam.gserviceaccount.com'
-# os.environ['EE_KEY']     = '/content/key.json'
-init_ee(EE_PROJECT, os.environ.get('EE_SA'), os.environ.get('EE_KEY'), FORCE_INTERACTIVE_AUTH)
-# Define a ROI somente DEPOIS da inicialização do EE
-# Utilitário: ler shapefile e obter ee.Geometry e bounds
-import json
-
-def _roi_from_shp(path: str):
-    geom = None
-    try:
-        if (geemap is not None) and hasattr(geemap, "shp_to_ee"):
-            fc = geemap.shp_to_ee(path)
-            geom = fc.geometry()
-    except Exception as e:
-        tqdm.write(f"shp_to_ee falhou; tentando geopandas. {str(e)[:80]}")
-    if geom is None:
-        try:
-            import geopandas as gpd
-            gdf = gpd.read_file(path)
-            if gdf.crs is None or gdf.crs.to_string().upper() != "EPSG:4326":
-                gdf = gdf.to_crs("EPSG:4326")
-            uni = gdf.unary_union
-            geom = ee.Geometry(json.loads(gpd.GeoSeries([uni]).to_json())["features"][0]["geometry"])
-        except Exception as e:
-            tqdm.write(f"Geopandas fallback falhou: {str(e)[:80]}")
-            raise
-    # bounds a partir do geometry no EE
-    bpoly = geom.bounds()
-    coords = bpoly.coordinates().getInfo()[0]
-    xs = [c[0] for c in coords]; ys = [c[1] for c in coords]
-    bounds = [min(xs), min(ys), max(xs), max(ys)]
-    return geom, bounds
-
-if USE_SHP and os.path.exists(SHP_PATH):
-    try:
-        ROI, ROI_BOUNDS = _roi_from_shp(SHP_PATH)
-        if VERBOSE:
-            tqdm.write(f"ROI via shapefile: {SHP_PATH}")
+        ee.Initialize(project=EE_PROJECT)
+        log(f"[EE] OK com project: {EE_PROJECT}")
+        return
     except Exception:
-        ROI = ee.Geometry.Rectangle(ROI_BOUNDS)
-        tqdm.write("Falha ao carregar shapefile; usando ROI retangular de fallback.")
-else:
-    ROI = ee.Geometry.Rectangle(ROI_BOUNDS)
+        pass
+    ee.Authenticate(auth_mode='notebook'); ee.Initialize(project=EE_PROJECT); log(f"[EE] OK (auth flow) {EE_PROJECT}")
 
-# agora que ROI/BOUNDS estão definidos, criamos a grade de tiles
-TILES = None  # será definido após a função make_tiles ser declarada
+init_ee()
 
-# ----------------------------
-# QA MASKS & COLEÇÃO
-# ----------------------------
+# ---------------- ROI do shapefile (fix topo) ----------------
+def load_roi_gdf(shp_path=SHP_PATH, override_crs=ROI_CRS_OVERRIDE):
+    with fiona.Env(SHAPE_RESTORE_SHX='YES'):              # <<< corrigido: usar fiona.Env
+        gdf = gpd.read_file(shp_path)
+    if override_crs is not None:
+        gdf = gdf.set_crs(override_crs, allow_override=True)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    # conserta topologia e dissolve em um único polígono
+    gdf["geometry"] = gdf.buffer(0)
+    gdf = gdf[~gdf.geometry.is_empty]
+    uni = gdf.unary_union
+    gdf_diss = gpd.GeoDataFrame(geometry=[uni], crs=gdf.crs)
+    return gdf_diss
 
-def cloud_shadow_mask(img: ee.Image) -> ee.Image:
-    # Aplica máscara só se a banda existir
+ROI_GDF = load_roi_gdf()
+if ROI_GDF.crs.to_string().upper() != "EPSG:4326":
+    ROI_GDF = ROI_GDF.to_crs("EPSG:4326")
+ROI_UNI = ROI_GDF.geometry.iloc[0]
+ROI_EE  = ee.Geometry(mapping(ROI_UNI))
+ROI_BOUNDS = ROI_EE.bounds(MAX_ERROR_M).coordinates().getInfo()[0]
+xs = [c[0] for c in ROI_BOUNDS]; ys = [c[1] for c in ROI_BOUNDS]
+log(f"[ROI] Bounds EPSG:4326: [{min(xs):.6f}, {min(ys):.6f}, {max(xs):.6f}, {max(ys):.6f}]")
+
+# ---------------- Coleções MODIS ----------------
+def cloud_shadow_mask(img):
     cond = img.bandNames().contains(QA_BAND_1KM)
     return ee.Image(ee.Algorithms.If(
         cond,
         img.updateMask(
-            img.select(QA_BAND_1KM).bitwiseAnd(3).neq(0)  # cloud
-            .Or(img.select(QA_BAND_1KM).bitwiseAnd(1 << 2).gt(0))  # shadow
-            .Not()
+            img.select(QA_BAND_1KM).bitwiseAnd(3).neq(0)
+              .Or(img.select(QA_BAND_1KM).bitwiseAnd(1<<2).gt(0))
+              .Not()
         ),
         img
     ))
 
-
-def qc_modland_good(img: ee.Image) -> ee.Image:
-    # Só aplica se a banda de QC 500m existir; caso contrário, mantém imagem
+def qc_modland_good(img):
     cond = img.bandNames().contains(QA_BAND_500M)
     return ee.Image(ee.Algorithms.If(
-        cond,
-        img.updateMask(img.select(QA_BAND_500M).bitwiseAnd(3).lte(1)),
-        img
+        cond, img.updateMask(img.select(QA_BAND_500M).bitwiseAnd(3).lte(1)), img
     ))
 
-
-def scale_sr(img: ee.Image) -> ee.Image:
-    scaled = img.select(SR_BANDS).multiply(SCALE_SR).rename(SR_BANDS)
-    # Seleciona QA se existir; senão cria banda 0 com o mesmo nome
-    qa1 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_1KM), img.select(QA_BAND_1KM), ee.Image(0).rename(QA_BAND_1KM)))
+def scale_sr(img):
+    scaled = img.select(SR_BANDS).multiply(0.0001).rename(SR_BANDS)
+    qa1 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_1KM),  img.select(QA_BAND_1KM),  ee.Image(0).rename(QA_BAND_1KM)))
     qa2 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_500M), img.select(QA_BAND_500M), ee.Image(0).rename(QA_BAND_500M)))
     return scaled.addBands([qa1, qa2]).copyProperties(img, img.propertyNames())
 
-# Remove máscaras dos SR (após scale_sr), preenchendo com 0 e liberando todos os pixels
-# Útil para produtos LAND sobre água no modo 'loose'.
-def clear_scaled_masks(img: ee.Image) -> ee.Image:
-    sr = img.select(SR_BANDS).unmask(0).updateMask(ee.Image(1))
-    qa1 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_1KM), img.select(QA_BAND_1KM), ee.Image(0).rename(QA_BAND_1KM)))
+def clear_scaled_masks(img):
+    sr  = img.select(SR_BANDS).unmask(0).updateMask(ee.Image(1))
+    qa1 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_1KM),  img.select(QA_BAND_1KM),  ee.Image(0).rename(QA_BAND_1KM)))
     qa2 = ee.Image(ee.Algorithms.If(img.bandNames().contains(QA_BAND_500M), img.select(QA_BAND_500M), ee.Image(0).rename(QA_BAND_500M)))
     return sr.addBands([qa1, qa2]).copyProperties(img, img.propertyNames())
 
-
-def add_goodfrac_prop(img: ee.Image) -> ee.Image:
-    mask_any = img.select(SR_BANDS[0]).mask().gt(0)
-    good_count = mask_any.reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=ROI, scale=SCALE_M,
-        maxPixels=MAX_PIXELS, tileScale=EE_TILE_SCALE
-    ).values().get(0)
-    total_count = ee.Image(1).reduceRegion(
-        reducer=ee.Reducer.count(), geometry=ROI, scale=SCALE_M,
-        maxPixels=MAX_PIXELS, tileScale=EE_TILE_SCALE
-    ).values().get(0)
-    frac = ee.Number(good_count).divide(ee.Number(total_count)).float()
-    return img.set({"goodFrac": frac})
-
-
-def modis_sr_collection(start: ee.Date, end: ee.Date, compute_goodfrac: bool, mask_strategy: str = MASK_STRATEGY) -> ee.ImageCollection:
-    mod09 = ee.ImageCollection("MODIS/061/MOD09GA").filterDate(start, end)
-    myd09 = ee.ImageCollection("MODIS/061/MYD09GA").filterDate(start, end)
-    ic = mod09.merge(myd09).filterBounds(ROI)
-    # aplica máscaras conforme estratégia
-    if mask_strategy == "strict":
+def build_collection(start, end):
+    mod = ee.ImageCollection("MODIS/061/MOD09GA").filterDate(start, end)
+    myd = ee.ImageCollection("MODIS/061/MYD09GA").filterDate(start, end)
+    ic  = mod.merge(myd).filterBounds(ROI_EE)
+    if MASK_STRATEGY == "strict":
         ic = ic.map(cloud_shadow_mask).map(qc_modland_good)
-    elif mask_strategy == "moderate":
+    elif MASK_STRATEGY == "moderate":
         ic = ic.map(qc_modland_good)
-    elif mask_strategy == "loose":
+    elif MASK_STRATEGY == "loose":
         pass
     else:
         ic = ic.map(qc_modland_good)
-    # Escala SR
     ic = ic.map(scale_sr)
-    # Se for loose e queremos pixels mesmo onde o LAND mascara água, remove máscaras
-    if mask_strategy == "loose" and FORCE_UNMASK_IN_LOOSE:
+    if MASK_STRATEGY == "loose" and FORCE_UNMASK_IN_LOOSE:
         ic = ic.map(clear_scaled_masks)
-    if compute_goodfrac:
-        ic = ic.map(add_goodfrac_prop)
     return ic
 
-# Fallback alternativo: coleções 8-dias (A1) se GA falhar
-def modis_sr_collection_alt(start: ee.Date, end: ee.Date) -> ee.ImageCollection:
-    mod09a1 = ee.ImageCollection("MODIS/061/MOD09A1").filterDate(start, end)
-    myd09a1 = ee.ImageCollection("MODIS/061/MYD09A1").filterDate(start, end)
-    ic = mod09a1.merge(myd09a1).filterBounds(ROI)
-    # sem máscara (loose), apenas escala
-    ic = ic.map(scale_sr)
-    return ic
+def make_mosaic(ic):
+    if COMPOSITE == "mean":
+        mos = ic.select(SR_BANDS).mean()
+    else:
+        mos = ic.select(SR_BANDS).median()
+    return mos.clip(ROI_EE).reproject(TARGET_CRS, None, TARGET_SCALE)
 
-
-def month_subset_and_mosaic(year: int, month: int, top_by_qa: int = TOP_BY_QA):
-    def _try_make_mosaic_from_ic(ic: ee.ImageCollection, top_by_qa_local):
-        try:
-            n_all = int(ic.size().getInfo())
-        except Exception:
-            n_all = 0
-        if n_all == 0:
-            return None, 0, 0
-        subset = ic if top_by_qa_local is None else ic.sort("goodFrac", False).limit(int(top_by_qa_local))
-        try:
-            n_used = int(subset.size().getInfo())
-        except Exception:
-            n_used = 0
-        if n_used == 0:
-            return None, n_all, 0
-        try:
-            mosaic = subset.select(SR_BANDS).median().clip(ROI)
-            # 1) teste padrão (count de pixels válidos)
-            try:
-                test = mosaic.select(SR_BANDS[0]).reduceRegion(
-                    reducer=ee.Reducer.count(), geometry=ROI,
-                    scale=SCALE_M, bestEffort=True,
-                    maxPixels=MAX_PIXELS, tileScale=EE_TILE_SCALE
-                )
-                valid_px = ee.Number(test.values().get(0)).getInfo()
-            except Exception:
-                valid_px = 0
-            # 2) fallback robusto: tenta amostrar 1 pixel
-            if int(valid_px) == 0:
-                try:
-                    ns = mosaic.select(SR_BANDS[0]).sample(
-                        region=ROI, scale=SCALE_M, numPixels=1,
-                        tileScale=EE_TILE_SCALE, geometries=False
-                    ).size().getInfo()
-                except Exception:
-                    ns = 0
-                if int(ns) == 0:
-                    return None, n_all, n_used
-            return mosaic, n_all, n_used
-        except Exception:
-            return None, n_all, n_used
-
-    # janela base
-    start = ee.Date.fromYMD(year, month, 1)
-    end   = start.advance(1, "month")
-
-    # ordem de tentativas por estratégia
-    order = [MASK_STRATEGY]
-    if RELAX_ON_EMPTY:
-        if MASK_STRATEGY == "strict":
-            order += ["moderate", "loose"]
-        elif MASK_STRATEGY == "moderate":
-            order += ["loose"]
-    tried = []
-
-    for strat in order:
-        if FORCE_A1_ONLY:
-            break
-        ic = modis_sr_collection(start, end, compute_goodfrac=(top_by_qa is not None), mask_strategy=strat)
-        mosaic, n_all, n_used = _try_make_mosaic_from_ic(ic, top_by_qa)
-        tried.append((f"GA:{strat}", n_all, n_used, mosaic is not None))
-        if mosaic is not None:
-            return ee.ImageCollection([]), mosaic, n_all, n_used
-
-    # janela expandida (última estratégia usada)
-    if EXPAND_WINDOW_MONTHS > 0:
-        ext_start = start.advance(-EXPAND_WINDOW_MONTHS, "month")
-        ext_end   = end.advance(EXPAND_WINDOW_MONTHS, "month")
-        ic_ext = modis_sr_collection(ext_start, ext_end, compute_goodfrac=(top_by_qa is not None), mask_strategy=order[-1].split(':')[-1] if ':' in order[-1] else order[-1])
-        mosaic, n_all, n_used = _try_make_mosaic_from_ic(ic_ext, top_by_qa)
-        tried.append((f"GA_ext:{order[-1]}", n_all, n_used, mosaic is not None))
-        if mosaic is not None:
-            tqdm.write(f"{year}-{month:02d}: janela expandida ±{EXPAND_WINDOW_MONTHS}m com GA/{order[-1]}.")
-            return ee.ImageCollection([]), mosaic, n_all, n_used
-
-    # fallback para A1 (8-dias), janela base e expandida
-    ic_a1 = modis_sr_collection_alt(start, end)
-    mosaic, n_all, n_used = _try_make_mosaic_from_ic(ic_a1, top_by_qa)
-    tried.append(("A1:loose", n_all, n_used, mosaic is not None))
-    if mosaic is not None:
-        tqdm.write(f"{year}-{month:02d}: usando coleções 8-dias (A1) sem máscara.")
-        return ee.ImageCollection([]), mosaic, n_all, n_used
-
-    if EXPAND_WINDOW_MONTHS > 0:
-        ic_a1_ext = modis_sr_collection_alt(start.advance(-EXPAND_WINDOW_MONTHS, "month"), end.advance(EXPAND_WINDOW_MONTHS, "month"))
-        mosaic, n_all, n_used = _try_make_mosaic_from_ic(ic_a1_ext, top_by_qa)
-        tried.append(("A1_ext:loose", n_all, n_used, mosaic is not None))
-        if mosaic is not None:
-            tqdm.write(f"{year}-{month:02d}: usando A1 com janela ±{EXPAND_WINDOW_MONTHS}m.")
-            return ee.ImageCollection([]), mosaic, n_all, n_used
-
-    if tried:
-        msgs = [f"{s}[{u}/{a}{' ok' if ok else ''}]" for s,a,u,ok in tried]
-        tqdm.write(f"{year}-{month:02d}: nenhum mosaico válido ({', '.join(msgs)}).")
-    return ee.ImageCollection([]), None, 0, 0
-
-# ----------------------------
-# TILES 4x4
-# ----------------------------
-
-def make_tiles(roi_bounds, nx=NX, ny=NY):
-    xmin, ymin, xmax, ymax = roi_bounds
-    dx = (xmax - xmin) / nx
-    dy = (ymax - ymin) / ny
-    tiles = []
-    k = 0
-    for j in range(ny):
-        for i in range(nx):
-            x0 = xmin + i*dx; x1 = xmin + (i+1)*dx
-            y0 = ymin + j*dy; y1 = ymin + (j+1)*dy
-            tiles.append((k+1, ee.Geometry.Rectangle([x0, y0, x1, y1])))
-            k += 1
-    return tiles
-
-# Define TILES agora que a função make_tiles já está declarada
-TILES = make_tiles(ROI_BOUNDS, NX, NY)
-
-# ----------------------------
-# FEATURES (imagem → bandas na ordem do modelo)
-# ----------------------------
-
+# ---------------- Features a partir do mosaico ----------------
 MODIS_TO_RRS = {
     "Rrs_443": "sur_refl_b03",
     "Rrs_490": "sur_refl_b03",
@@ -483,468 +190,202 @@ MODIS_TO_RRS = {
     "Rrs_665": "sur_refl_b01",
 }
 
+def build_features_image(mosaic, feature_names):
+    base = {b: mosaic.select(b) for b in SR_BANDS}
+    proxies = {k: base[v] for k, v in MODIS_TO_RRS.items()}
 
-def build_features_image(mosaic: ee.Image, feature_names: list) -> ee.Image:
-    bands = []
-    try:
-        mosaic_band_list = mosaic.bandNames().getInfo()
-    except Exception:
-        mosaic_band_list = SR_BANDS
-    base = {b: mosaic.select(b) for b in SR_BANDS if b in mosaic_band_list}
-    proxies = {k: base[v] for k, v in MODIS_TO_RRS.items() if v in base}
-
-    def safe_div(a, b):
-        return a.divide(b.add(1e-12))
-    def sum_bands(imglist):
-        if not imglist:
-            return ee.Image(1e-12)
-        out = imglist[0]
-        for im in imglist[1:]:
-            out = out.add(im)
+    def safe_div(a,b): return a.divide(b.add(1e-12))
+    def sum_bands(lst):
+        out = lst[0]
+        for im in lst[1:]: out = out.add(im)
         return out.add(1e-12)
+    L1 = sum_bands([base[b] for b in SR_BANDS])
 
-    L1 = sum_bands(list(base.values())) if base else ee.Image(1e-12)
-
+    bands = []
     for fname in feature_names:
-        img_band = None
+        img = None
         if fname in proxies:
-            img_band = proxies[fname].rename(fname)
+            img = proxies[fname].rename(fname)
         elif fname.endswith("_norm560"):
-            stem = fname.replace("_norm560", "")
+            stem = fname.replace("_norm560","")
             if (stem in proxies) and ("Rrs_560" in proxies):
-                img_band = safe_div(proxies[stem], proxies["Rrs_560"]).rename(fname)
+                img = safe_div(proxies[stem], proxies["Rrs_560"]).rename(fname)
         elif fname == "norm_Rrs_L1":
-            img_band = L1.rename(fname)
+            img = L1.rename(fname)
         elif fname.endswith("_normL1"):
-            stem = fname.replace("_normL1", "")
+            stem = fname.replace("_normL1","")
             if stem in proxies:
-                img_band = safe_div(proxies[stem], L1).rename(fname)
+                img = safe_div(proxies[stem], L1).rename(fname)
         elif fname == "G_over_B":
-            if ("sur_refl_b04" in base) and ("sur_refl_b03" in base):
-                img_band = safe_div(base["sur_refl_b04"], base["sur_refl_b03"]).rename(fname)
+            img = safe_div(base["sur_refl_b04"], base["sur_refl_b03"]).rename(fname)
         elif fname == "B_over_R":
-            if ("sur_refl_b03" in base) and ("sur_refl_b01" in base):
-                img_band = safe_div(base["sur_refl_b03"], base["sur_refl_b01"]).rename(fname)
+            img = safe_div(base["sur_refl_b03"], base["sur_refl_b01"]).rename(fname)
         elif fname == "Red_a":
-            img_band = ee.Image(0).rename(fname)
-        if img_band is None:
-            img_band = ee.Image(0).rename(fname)
-        bands.append(img_band)
+            img = ee.Image(0).rename(fname)
+        if img is None:
+            img = ee.Image(0).rename(fname)
+        bands.append(img)
+    return ee.Image.cat(bands).reproject(TARGET_CRS, None, TARGET_SCALE)
 
-    return ee.Image.cat(bands)
-
-# ----------------------------
-# EXPORTAÇÃO DE TILES (features)
-# ----------------------------
-
-def _export_with_geemap(img: ee.Image, region: ee.Geometry, out_path: str, scale_m: float, crs: str | None):
-    kwargs = dict(filename=out_path, scale=scale_m, region=region, file_per_band=False, maxPixels=MAX_PIXELS)
-    if crs:
-        kwargs.update(crs=crs)
-    geemap.ee_export_image(img, **kwargs)
-
-
-def _export_with_downloadurl(img: ee.Image, region: ee.Geometry, out_path: str, scale_m: float, crs: str | None):
-    import zipfile, io
-    params = {'scale': scale_m, 'region': region, 'maxPixels': MAX_PIXELS, 'format': 'GEO_TIFF'}
-    if crs:
-        params['crs'] = crs
+# ---------------- Export one-shot ----------------
+def export_image_to_tif(img, out_path, region=ROI_EE, scale=TARGET_SCALE, crs=TARGET_CRS):
+    params = {'scale': scale, 'region': region, 'maxPixels': MAX_PIXELS, 'format': 'GEO_TIFF', 'crs': crs}
     url = img.getDownloadURL(params)
     r = requests.get(url, timeout=600, allow_redirects=True)
-    if r.status_code != 200:
-        raise RuntimeError(f"Download falhou: HTTP {r.status_code}")
+    r.raise_for_status()
     data = r.content
-    is_zip = data[:2] == b'PK'
-    if is_zip:
+    if data[:2] == b'PK':
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            tif_names = [n for n in zf.namelist() if n.lower().endswith(('.tif', '.tiff'))]
-            if not tif_names:
-                raise RuntimeError("ZIP não contém GeoTIFF")
-            with zf.open(tif_names[0]) as zt, open(out_path, 'wb') as f:
-                if SHOW_PROGRESS:
-                    size = zf.getinfo(tif_names[0]).file_size
-                    with tqdm(total=size, unit='B', unit_scale=True, desc=f"UZ {Path(out_path).name}", leave=False) as pbar:
-                        while True:
-                            chunk = zt.read(1<<20)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            pbar.update(len(chunk))
-                else:
-                    f.write(zt.read())
+            names = [n for n in zf.namelist() if n.lower().endswith(('.tif','.tiff'))]
+            with zf.open(names[0]) as zt, open(out_path, 'wb') as f: f.write(zt.read())
     else:
-        total = len(data)
-        if SHOW_PROGRESS and total > 0:
-            with open(out_path, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True, desc=f"DL {Path(out_path).name}", leave=False) as pbar:
-                f.write(data)
-                pbar.update(total)
-        else:
-            with open(out_path, 'wb') as f:
-                f.write(data)
+        with open(out_path, 'wb') as f: f.write(data)
 
-def export_tile_geotiff(img: ee.Image, region: ee.Geometry, out_path: Path, scale=SCALE_M, crs=CRS):
-    """Exporta GeoTIFF multi-banda. Tenta geemap, cai para DownloadURL (ZIP-safe)."""
-    out_path = str(out_path)
-    if geemap is not None:
-        try:
-            _export_with_geemap(img, region, out_path, scale, crs)
-            return
-        except Exception as e:
-            log(f"geemap falhou ({e}), usando getDownloadURL...")
-    _export_with_downloadurl(img, region, out_path, scale, crs)
+# ---------------- Máscara do shapefile no raster ----------------
+def roi_mask_array_like(dataset):
+    gdf = ROI_GDF
+    src_crs = gdf.crs
+    dst_crs = dataset.crs
+    geoms_tx = [transform_geom(src_crs.to_string(), dst_crs.to_string(), mapping(g), precision=6)
+                for g in gdf.geometry]
+    mask = rasterize([(g,1) for g in geoms_tx],
+                     out_shape=(dataset.height, dataset.width),
+                     transform=dataset.transform,
+                     fill=0, all_touched=True, dtype="uint8").astype(bool)
+    return mask
 
-# ----------------------------
-# PREDIÇÃO (two-stage -> mg/m3)
-# ----------------------------
-
+# ---------------- Modelo ----------------
 def load_model():
     if Path(P_TWO_STAGE).exists():
-        M = joblib.load(P_TWO_STAGE)
-        if VERBOSE: tqdm.write("Modelo two-stage carregado")
-        return ("two", M)
-    elif Path(P_SVR_GLOB).exists():
-        M = joblib.load(P_SVR_GLOB)
-        if VERBOSE: tqdm.write("Modelo global (SVR) carregado")
-        return ("svr", M)
+        M = joblib.load(P_TWO_STAGE); return "two", M, M["features"]
+    if Path(P_SVR_GLOB).exists():
+        M = joblib.load(P_SVR_GLOB);  return "svr", M, M["features"]
+    raise RuntimeError("Nenhum modelo encontrado em /content/artifacts_curuai/")
+
+def inverse_transform(y):
+    if PRED_INVERSE == "ln1p":
+        return np.expm1(y)
+    elif PRED_INVERSE == "log10_1p":
+        return (10.0**y) - 1.0
     else:
-        raise RuntimeError("Nenhum modelo encontrado. Verifique /content/artifacts_curuai/")
+        return y
 
+# ---------------- Predição ----------------
+def predict_from_features_tif(tif_path, model_kind, M, nodata_out=NODATA_PRED):
+    with rio.open(tif_path) as ds:
+        arr = ds.read()                   # (B,H,W)
+        prof = ds.profile
+        roi_mask = roi_mask_array_like(ds)
+        valid_mask = np.ones((arr.shape[1], arr.shape[2]), dtype=bool)
+        for i in range(arr.shape[0]):
+            valid_mask &= (ds.read_masks(i+1) > 0)
+        valid_mask &= roi_mask
 
-def predict_tile_from_features_tif(tif_path: str, model_kind: str, M, nodata_out=-9999.0):
-    try:
-        with rio.open(tif_path) as ds:
-            arr = ds.read()  # (B, H, W)
-            prof = ds.profile
-            valid_mask = np.ones((arr.shape[1], arr.shape[2]), dtype=bool)
-            for i in range(arr.shape[0]):
-                band_mask = ds.read_masks(i+1) > 0
-                valid_mask &= band_mask
-    except Exception as e:
-        tqdm.write(f"Erro ao ler {tif_path}: {e}")
-        return None
-
-    mask = ~valid_mask
     B, H, W = arr.shape
-    data = arr.reshape(B, -1).T.astype("float32")
-
+    data  = arr.reshape(B, -1).T.astype("float32")
     y_log = np.full(data.shape[0], np.nan, dtype="float32")
+    valid = valid_mask.reshape(-1)
 
-    valid = ~mask.reshape(-1)
-    if valid.sum() > 0:
+    if valid.any():
         X = data[valid]
-        finite_mask = np.isfinite(X).all(axis=1)
-        if finite_mask.any():
-            X_clean = X[finite_mask]
-            valid_indices = np.where(valid)[0][finite_mask]
-            try:
-                if model_kind == "two":
-                    clf = M["classifier"]
-                    low_reg = M["low_regressor"]
-                    high_reg = M["high_regressor"]
-                    c = clf.predict(X_clean).astype(int)
-                    yhat = np.empty(X_clean.shape[0], dtype="float32")
-                    m0 = (c == 0); m1 = ~m0
-                    if m0.any():
-                        yhat[m0] = low_reg.predict(X_clean[m0]).astype("float32")
-                    if m1.any():
-                        yhat[m1] = high_reg.predict(X_clean[m1]).astype("float32")
-                    y_log[valid_indices] = yhat
-                else:
-                    model = M["model"]
-                    y_log[valid_indices] = model.predict(X_clean).astype("float32")
-            except Exception as e:
-                tqdm.write(f"Erro na predição ({Path(tif_path).name}): {e}")
-                return None
+        finite = np.isfinite(X).all(axis=1)
+        if finite.any():
+            Xc  = X[finite]
+            idx = np.where(valid)[0][finite]
+            if model_kind == "two":
+                clf = M["classifier"]; low = M["low_regressor"]; high = M["high_regressor"]
+                c = clf.predict(Xc).astype(int)
+                yhat = np.empty(Xc.shape[0], dtype="float32")
+                m0 = (c == 0); m1 = ~m0
+                if m0.any():  yhat[m0] = low.predict(Xc[m0]).astype("float32")
+                if m1.any():  yhat[m1] = high.predict(Xc[m1]).astype("float32")
+                y_log[idx] = yhat
+            else:
+                y_log[idx] = M["model"].predict(Xc).astype("float32")
 
-    y_lin = np.expm1(y_log.astype("float64"))
-    y_lin[~np.isfinite(y_lin)] = np.nan
-
-    pred = y_lin.reshape(H, W).astype("float32")
-    pred[np.isnan(pred)] = nodata_out
+    y_lin = inverse_transform(y_log.astype("float64"))
+    pred  = y_lin.reshape(H, W).astype("float32")
+    pred[~valid_mask] = nodata_out
+    pred[~np.isfinite(pred)] = nodata_out
 
     prof_out = prof.copy()
     prof_out.update(dtype="float32", count=1, nodata=nodata_out, compress="deflate")
     out_path = str(tif_path).replace("features/curuai_feats_", "pred/curuai_chla_")
+    with rio.open(out_path, "w", **prof_out) as dst: dst.write(pred, 1)
+    return out_path
 
+# ---------------- Preview e quantis ----------------
+def preview_png(tif_path, title=None):
+    with rio.open(tif_path) as ds:
+        arr = ds.read(1, masked=True)
+        ext = plotting_extent(ds)
+        crs = ds.crs
     try:
-        with rio.open(out_path, "w", **prof_out) as dst:
-            dst.write(pred, 1)
-        return out_path
-    except Exception as e:
-        tqdm.write(f"Erro ao salvar predição ({Path(tif_path).name}): {e}")
-        return None
-
-# ----------------------------
-# MOSAICAR TILES PRED → mensal
-# ----------------------------
-
-def mosaic_pred_month(ym_tag: str, out_path: Path, nodata_val: float = -9999.0):
-    pats = sorted(glob.glob(str(DIR_PRED / f"curuai_chla_{ym_tag}_tile*.tif")))
-    if not pats:
-        return None
-    try:
-        srcs = [rio.open(p) for p in pats]
-        mosaic, out_trans = rio_merge(srcs, nodata=nodata_val)
-        prof = srcs[0].profile.copy()
-        for s in srcs:
-            s.close()
-        prof.update(transform=out_trans, height=mosaic.shape[1], width=mosaic.shape[2], nodata=nodata_val, dtype="float32", count=1, compress="deflate")
-        with rio.open(out_path, "w", **prof) as dst:
-            dst.write(mosaic[0], 1)
-        return out_path
-    except Exception as e:
-        tqdm.write(f"Erro mosaico mensal {ym_tag}: {e}")
-        return None
-
-# ----------------------------
-# SANITY CHECK
-# ----------------------------
-
-def ensure_ee() -> bool:
-    """Tenta 1) ping, 2) reinit, 3) geemap; retorna True se ping ok."""
-    try:
-        _ = ee.Number(1).getInfo()
-        return True
-    except Exception as e:
-        ok = init_ee(EE_PROJECT, os.environ.get('EE_SA'), os.environ.get('EE_KEY'), FORCE_INTERACTIVE_AUTH)
-        if not ok:
-            tqdm.write("EE não respondeu e reinit falhou.")
-            return False
-        try:
-            _ = ee.Number(1).getInfo()
-            return True
-        except Exception as e2:
-            tqdm.write(f"EE ping falhou: {str(e2)[:120]}")
-            return False
-
-def sanity_check() -> bool:
-    """Confere autenticação e dados mínimos (sem depender do pipeline)."""
-    if not ensure_ee():
-        if BYPASS_SANITY_ON_ERROR:
-            tqdm.write("SanityCheck: sem ping do EE; seguindo mesmo assim.")
-            return True
-        return False
-    # existe MODIS na ROI?
-    try:
-        n_ga = ee.ImageCollection("MODIS/061/MOD09GA").filterDate('2019-07-01','2019-08-01').filterBounds(ROI).size().getInfo()
-        if int(n_ga) == 0:
-            tqdm.write("0 imagens MODIS GA na ROI. Verifique ROI_BOUNDS.")
-            return BYPASS_SANITY_ON_ERROR
-    except Exception as e:
-        tqdm.write(f"Falha ao consultar MODIS GA: {str(e)[:120]}")
-        return BYPASS_SANITY_ON_ERROR
-    # tenta amostrar 1 pixel GA/loose, senão A1
-    try:
-        ic = modis_sr_collection(ee.Date('2019-07-01'), ee.Date('2019-08-01'), compute_goodfrac=False, mask_strategy='loose')
-        mosaic = ic.select(SR_BANDS).median().clip(ROI)
-        ns = mosaic.select(SR_BANDS[0]).sample(ROI, SCALE_M, numPixels=1, tileScale=EE_TILE_SCALE, geometries=False).size().getInfo()
-        if int(ns) > 0:
-            return True
-    except Exception as e:
-        tqdm.write(f"SanityCheck GA erro: {str(e)[:120]}")
-        if BYPASS_SANITY_ON_ERROR:
-            return True
-        return False
-    try:
-        ic_a1 = modis_sr_collection_alt(ee.Date('2019-07-01'), ee.Date('2019-08-01'))
-        mosaic2 = ic_a1.select(SR_BANDS).median().clip(ROI)
-        ns2 = mosaic2.select(SR_BANDS[0]).sample(ROI, SCALE_M, numPixels=1, tileScale=EE_TILE_SCALE, geometries=False).size().getInfo()
-        if int(ns2) > 0:
-            return True
-        tqdm.write("Sem pixels amostrados em LOOSER nem em A1.")
-        return BYPASS_SANITY_ON_ERROR
-    except Exception as e:
-        tqdm.write(f"SanityCheck A1 erro: {str(e)[:120]}")
-        return BYPASS_SANITY_ON_ERROR
-
-
-def main():
-    try:
-        model_kind, M = load_model()
-        FEATURE_LIST = M["features"]
-    except Exception as e:
-        tqdm.write(f"Erro ao carregar modelo: {e}")
-        return
-
-    # Checagem de sanidade antes de qualquer loop caro
-    if not sanity_check():
-        return
-
-    counts = []
-    ts_rows = []
-    tiles = TILES
-
-    total_months = (END_YEAR - START_YEAR + 1) * 12
-
-    month_iter = range(START_YEAR, END_YEAR + 1)
-
-    if SHOW_PROGRESS:
-        pbar_months = tqdm(total=total_months, desc="Meses", position=0)
-    processed = 0
-
-    for year in month_iter:
-        for month in range(1, 13):
-            ym = f"{year:04d}-{month:02d}"
-
-            subset, mosaic, n_all, n_used = month_subset_and_mosaic(year, month)
-            counts.append({"ym": ym, "n_all": n_all, "n_used": n_used})
-
-            if SHOW_PROGRESS:
-                pbar_months.set_postfix({'imgs': n_used, 'ano': year, 'mes': month})
-
-            if (mosaic is None) or (n_used == 0):
-                if SHOW_PROGRESS:
-                    pbar_months.update(1)
-                processed += 1
-                continue
-
-            try:
-                feat_img = build_features_image(mosaic, FEATURE_LIST)
-            except Exception as e:
-                tqdm.write(f"Erro features {ym}: {e}")
-                if SHOW_PROGRESS:
-                    pbar_months.update(1)
-                processed += 1
-                continue
-
-            tiles_ok = 0
-            pbar_tiles = tqdm(total=len(tiles), desc=f"Tiles {ym}", position=1, leave=False) if SHOW_PROGRESS else None
-
-            for k, geom in tiles:
-                f_out = DIR_FEATS / f"curuai_feats_{ym}_tile{k}.tif"
-                if not f_out.exists():
-                    try:
-                        export_tile_geotiff(feat_img, geom, f_out, scale=SCALE_M, crs=CRS)
-                    except Exception as e:
-                        tqdm.write(f"Tile {k} export falhou {ym}: {e}")
-                        if SHOW_PROGRESS and pbar_tiles: pbar_tiles.update(1)
-                        continue
-                try:
-                    pred_tile_path = predict_tile_from_features_tif(str(f_out), model_kind, M)
-                    if pred_tile_path:
-                        tiles_ok += 1
-                except Exception as e:
-                    tqdm.write(f"Tile {k} predição falhou {ym}: {e}")
-                finally:
-                    if SHOW_PROGRESS and pbar_tiles: pbar_tiles.update(1)
-
-            if SHOW_PROGRESS and pbar_tiles:
-                pbar_tiles.close()
-
-            if tiles_ok == 0:
-                if SHOW_PROGRESS:
-                    pbar_months.update(1)
-                processed += 1
-                continue
-
-            monthly_out = DIR_PRED / f"curuai_chla_{ym}.tif"
-            try:
-                if mosaic_pred_month(ym, monthly_out):
-                    with rio.open(monthly_out) as ds:
-                        a = ds.read(1, masked=True)
-                    vals = a.compressed() if hasattr(a, 'compressed') else a[np.isfinite(a)]
-                    if vals.size > 0:
-                        mean_chla = float(vals.mean())
-                        ts_rows.append({"ym": ym, "mean_chla": mean_chla})
-            except Exception as e:
-                tqdm.write(f"Erro no mosaico {ym}: {e}")
-
-            if SHOW_PROGRESS:
-                pbar_months.update(1)
-            processed += 1
-
-    if SHOW_PROGRESS:
-        pbar_months.close()
-
-    # ----------------------------
-# SALVAR CSVs E GRÁFICOS
-# ----------------------------
-    try:
-        pd.DataFrame(counts).to_csv(COUNT_CSV, index=False)
-    except Exception as e:
-        tqdm.write(f"Erro ao salvar contagens: {e}")
-
-    if ts_rows:
-        try:
-            ts = pd.DataFrame(ts_rows).set_index("ym").sort_index()
-            ts.to_csv(TS_CSV, index=True)
-        except Exception as e:
-            tqdm.write(f"Erro ao salvar série temporal: {e}")
-            ts = pd.DataFrame(columns=["mean_chla"])
-    else:
-        ts = pd.DataFrame(columns=["mean_chla"])
-
-    try:
-        # --- Série temporal ---
-        if not ts.empty:
-            plt.figure(figsize=(14, 5))
-            plt.plot(ts.index, ts["mean_chla"], lw=1.5, marker='o', markersize=3)
-            plt.title("Clorofila-a média mensal (ROI Curuai) — mg/m³", fontsize=14)
-            plt.xlabel("Mês"); plt.ylabel("Chl-a (mg/m³)")
-            plt.xticks(rotation=45); plt.grid(True, alpha=0.3); plt.tight_layout()
-            if SAVE_PLOTS:
-                plt.savefig(PLOT_DIR / "timeseries_chla.png", dpi=150, bbox_inches="tight")
-            if SHOW_INLINE_PLOTS:
-                plt.show()
-            plt.close()
-
-        # --- Contagem média por mês do ano ---
-        try:
-            cnt = pd.read_csv(COUNT_CSV)
-        except Exception:
-            cnt = pd.DataFrame()
-        if not cnt.empty:
-            cnt["year"] = pd.to_numeric(cnt["ym"].str.slice(0,4), errors="coerce")
-            cnt["month"] = pd.to_numeric(cnt["ym"].str.slice(5,7), errors="coerce")
-            cnt_clean = cnt.dropna(subset=["month", "year"]).copy()
-            if not cnt_clean.empty:
-                by_moy = cnt_clean.groupby("month")[['n_all','n_used']].mean(numeric_only=True).reset_index()
-                plt.figure(figsize=(10,5))
-                plt.plot(by_moy["month"], by_moy["n_all"], marker="o", label="Disponíveis (média)", linewidth=2)
-                plt.plot(by_moy["month"], by_moy["n_used"], marker="s", label="Usadas (média)", linewidth=2)
-                plt.xticks(range(1,13), ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'])
-                plt.xlabel("Mês do ano"); plt.ylabel("Nº de imagens")
-                plt.title(f"MODIS — Quantidade de imagens por mês (média {START_YEAR}–{END_YEAR})")
-                plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-                if SAVE_PLOTS:
-                    plt.savefig(PLOT_DIR / "counts_by_month.png", dpi=150, bbox_inches="tight")
-                if SHOW_INLINE_PLOTS:
-                    plt.show()
-                plt.close()
-
-        # --- Boxplot por mês do ano (2001–2024) ---
-        if not ts.empty:
-            ts_box = ts.reset_index().copy()
-            ts_box["year"] = pd.to_numeric(ts_box["ym"].str.slice(0,4), errors="coerce")
-            ts_box["month"] = pd.to_numeric(ts_box["ym"].str.slice(5,7), errors="coerce")
-            ts_box = ts_box.dropna(subset=["month"]).copy()
-            data = [ts_box.loc[ts_box["month"]==m, "mean_chla"].dropna().values for m in range(1,13)]
-            if any(len(d)>0 for d in data):
-                plt.figure(figsize=(12,5))
-                plt.boxplot(data, labels=['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'], showmeans=True)
-                plt.ylabel("Chl-a (mg/m³)")
-                plt.title(f"Clorofila-a — distribuição por mês do ano ({START_YEAR}–{END_YEAR})")
-                plt.grid(True, axis='y', alpha=0.3)
-                plt.tight_layout()
-                if SAVE_PLOTS:
-                    plt.savefig(PLOT_DIR / "boxplot_chla_by_month.png", dpi=150, bbox_inches="tight")
-                if SHOW_INLINE_PLOTS:
-                    plt.show()
-                plt.close()
-    except Exception as e:
-        tqdm.write(f"Erro ao gerar gráficos: {e}")
-
-    # Resumo final mínimo
-    try:
-        total_months = (END_YEAR - START_YEAR + 1) * 12
-        meses_com_dado = len(ts_rows)
-        tqdm.write(f"Concluído. Meses com dados: {meses_com_dado}/{total_months}. Saídas: {ART}")
-        if SAVE_PLOTS:
-            tqdm.write(f"Gráficos salvos em: {PLOT_DIR}")
+        gdf = ROI_GDF.to_crs(crs)
     except Exception:
-        pass
+        gdf = None
+    v = arr.compressed()
+    if v.size:
+        vmin, vmax = np.percentile(v, (2,98))
+    else:
+        vmin, vmax = 0, 1
+    plt.figure(figsize=(7,6))
+    plt.imshow(arr, extent=ext, vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
+    if gdf is not None: gdf.boundary.plot(ax=plt.gca(), linewidth=1.1, edgecolor="black")
+    plt.title(title or Path(tif_path).name); plt.xticks([]); plt.yticks([]); plt.tight_layout()
+    out = PLOT_DIR / f"preview_{Path(tif_path).stem}.png"
+    plt.savefig(out, dpi=160, bbox_inches="tight"); plt.close()
+    log(f"[PREVIEW] {out}")
+
+def print_quantiles(tif_path):
+    with rio.open(tif_path) as ds:
+        a = ds.read(1)
+        m = (a != NODATA_PRED) & np.isfinite(a)
+        v = a[m]
+    if v.size:
+        q = np.percentile(v, [5,25,50,75,90,95,99])
+        log(f"[Q] 5%={q[0]:.1f} 25%={q[1]:.1f} 50%={q[2]:.1f} 75%={q[3]:.1f} 90%={q[4]:.1f} 95%={q[5]:.1f} 99%={q[6]:.1f} µg/L")
+    else:
+        log("[Q] sem dados válidos")
+
+# ---------------- Main ----------------
+def main():
+    model_kind, M, FEATURE_LIST = load_model()
+    log(f"[MODEL] tipo={model_kind}  |  #features={len(FEATURE_LIST)}  |  Project EE: {EE_PROJECT}")
+    months = MONTHS_FILTER if MONTHS_FILTER else list(range(1,13))
+
+    for year in range(START_YEAR, END_YEAR+1):
+        for month in months:
+            ym = f"{year:04d}-{month:02d}"
+            feats_tif = DIR_FEATS / f"curuai_feats_{ym}.tif"
+            pred_tif  = DIR_PRED  / f"curuai_chla_{ym}.tif"
+
+            try:
+                start = ee.Date.fromYMD(year, month, 1); end = start.advance(1, "month")
+                ic    = build_collection(start, end)
+                n = int(ic.size().getInfo())
+                log(f"[{ym}] imagens MODIS: {n}")
+                if n == 0:
+                    log(f"[{ym}] sem imagens — pulando"); continue
+
+                mosaic   = make_mosaic(ic)
+                feats_im = build_features_image(mosaic, FEATURE_LIST)
+
+                log(f"[{ym}] exportando features...")
+                export_image_to_tif(feats_im, str(feats_tif), region=ROI_EE, scale=TARGET_SCALE, crs=TARGET_CRS)
+                log(f"[export] {feats_tif}")
+
+                log(f"[{ym}] predizendo...")
+                pred_path = predict_from_features_tif(str(feats_tif), model_kind, M)
+                log(f"[pred]   {pred_path}")
+
+                preview_png(pred_path, title=f"Chl-a predito {ym}")
+                print_quantiles(pred_path)
+
+            except Exception as e:
+                log(f"[{ym}] ERRO: {e}")
+
+    log(f"\n[OK] Processamento concluído. Saídas em: {ART}")
 
 if __name__ == "__main__":
-    main()
-
     main()
