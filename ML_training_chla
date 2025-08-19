@@ -5,6 +5,7 @@
 # - modelos globais e por-faixa (two-stage)
 # - SVR com Optuna
 # - métricas e ranking
+# - MODO MODIS opcional com 709 virtual como candidata
 # ============================================================
 
 !pip -q install optuna xgboost lightgbm
@@ -47,6 +48,11 @@ RANDOM_STATE     = 42
 
 # pesos por faixa (para modelos globais)
 W_LOW, W_MID, W_HIGH = 1.2, 1.0, 1.5
+
+# ----------------------------
+# Sensor alvo (OLCI = padrão; MODIS ativa banda 709 virtual candidata)
+# ----------------------------
+SENSOR = "OLCI"  # opções: "OLCI" (padrão, comportamento original) ou "MODIS"
 
 # ----------------------------
 # Helpers
@@ -130,7 +136,14 @@ rrs = pd.read_excel(RRSPATH)
 sta = pd.read_excel(STPATH, sheet_name="Data")
 
 band_cols_all = [c for c in rrs.columns if c.startswith("Rrs_")]
-wanted = [443,490,510,560,620,665,681,700,705,708,709]
+
+if SENSOR == "MODIS":
+    # MODIS Aqua/Terra (Rrs após AC): bandas compatíveis com águas interiores
+    wanted = [443,488,531,547,667,678,748]   # 748 ajuda no FLH e na 709 virtual
+else:
+    # OLCI/MERIS/hiperespectral convolvido (comportamento original)
+    wanted = [443,490,510,560,620,665,681,700,705,708,709]
+
 band_core = [f"Rrs_{b}" for b in wanted if f"Rrs_{b}" in band_cols_all]
 if not band_core: band_core = band_cols_all
 
@@ -192,30 +205,112 @@ for b in band_core:
 # Engenharia espectral
 # ----------------------------
 B = df[band_core].copy()
-F = B.copy()
-if "Rrs_560" in B.columns:
-    for c in B.columns: F[c+"_norm560"] = B[c] / (B["Rrs_560"] + 1e-12)
-F["norm_Rrs_L1"] = B.sum(axis=1) + 1e-12
-for c in B.columns: F[c+"_normL1"] = B[c] / F["norm_Rrs_L1"]
 
-# índices relevantes
-if {"Rrs_708","Rrs_665"}.issubset(B.columns): F["NDCI"] = safe_ratio(B["Rrs_708"], B["Rrs_665"])
-if {"Rrs_681","Rrs_665"}.issubset(B.columns): F["Red_a"] = safe_ratio(B["Rrs_681"], B["Rrs_665"])
-if {"Rrs_560","Rrs_490"}.issubset(B.columns): F["G_over_B"] = B["Rrs_560"] / (B["Rrs_490"] + 1e-12)
-if {"Rrs_490","Rrs_665"}.issubset(B.columns): F["B_over_R"] = B["Rrs_490"] / (B["Rrs_665"] + 1e-12)
-if {"Rrs_709","Rrs_681"}.issubset(B.columns): F["RedEdgeSlope"] = B["Rrs_709"] - B["Rrs_681"]
-if {"Rrs_700","Rrs_665"}.issubset(B.columns): F["RedPeakMinusR"] = B["Rrs_700"] - B["Rrs_665"]
-if {"Rrs_705","Rrs_681"}.issubset(B.columns): F["Slope_681_705"] = B["Rrs_705"] - B["Rrs_681"]
+if SENSOR == "MODIS":
+    F = B.copy()
 
-F["Area_Blue"]  = window_sum(B, 440, 500, band_core)
-F["Area_Green"] = window_sum(B, 520, 580, band_core)
-F["Area_Red"]   = window_sum(B, 650, 700, band_core)
-F["Area_RE"]    = window_sum(B, 700, 710, band_core)
+    # --- 709 virtual (candidata) ---
+    # Preferência: interpolação linear entre 678 e 748; fallback: extrapolação a partir de 667–678.
+    R709 = None
+    if {"Rrs_678","Rrs_748"}.issubset(B.columns):
+        frac = (709 - 678) / (748 - 678)
+        R709 = B["Rrs_678"] + (B["Rrs_748"] - B["Rrs_678"]) * frac
+    elif {"Rrs_667","Rrs_678"}.issubset(B.columns) and (678 - 667) != 0:
+        frac = (709 - 678) / (678 - 667)
+        R709 = B["Rrs_678"] + (B["Rrs_678"] - B["Rrs_667"]) * frac
+    if R709 is not None:
+        F["Rrs_709"] = R709.clip(lower=0)
 
-d1 = first_derivative(B); d2 = second_derivative(B)
-for k,v in d1.items(): F[k] = v
-for k,v in d2.items(): F[k] = v
+    # Normalizações (usar 547 como pivô quando disponível)
+    if "Rrs_547" in B.columns:
+        for c in B.columns:
+            F[c+"_norm547"] = B[c] / (B["Rrs_547"] + 1e-12)
+        if "Rrs_709" in F.columns:
+            F["Rrs_709_norm547"] = F["Rrs_709"] / (B["Rrs_547"] + 1e-12)
+    F["norm_Rrs_L1"] = B.sum(axis=1) + 1e-12
+    for c in B.columns:
+        F[c+"_normL1"] = B[c] / F["norm_Rrs_L1"]
+    if "Rrs_709" in F.columns:
+        F["Rrs_709_normL1"] = F["Rrs_709"] / F["norm_Rrs_L1"]
 
+    # Razões/diferenças suportadas por MODIS
+    if {"Rrs_678","Rrs_667"}.issubset(B.columns):
+        F["Red678_over_Red667"]  = B["Rrs_678"] / (B["Rrs_667"] + 1e-12)
+        F["Red678_minus_Red667"] = B["Rrs_678"] - B["Rrs_667"]
+    if {"Rrs_547","Rrs_488"}.issubset(B.columns):
+        F["G_over_B"] = B["Rrs_547"] / (B["Rrs_488"] + 1e-12)
+    if {"Rrs_488","Rrs_667"}.issubset(B.columns):
+        F["B_over_R"] = B["Rrs_488"] / (B["Rrs_667"] + 1e-12)
+
+    # NDCI "virtual" (se 709 virtual existir). Se 665 não existir, usar 667 como proxy.
+    if "Rrs_709" in F.columns:
+        if "Rrs_665" not in F.columns and "Rrs_667" in B.columns:
+            F["Rrs_665"] = B["Rrs_667"]
+        if {"Rrs_709","Rrs_665"}.issubset(F.columns):
+            F["NDCI"] = safe_ratio(F["Rrs_709"], F["Rrs_665"])
+        # Red-edge slope com 681 ou 678 (se 681 inexiste no MODIS)
+        if "Rrs_681" in B.columns:
+            F["RedEdgeSlope"] = F["Rrs_709"] - B["Rrs_681"]
+        elif "Rrs_678" in B.columns:
+            F["RedEdgeSlope"] = F["Rrs_709"] - B["Rrs_678"]
+        # Janela red-edge 700–710 representada pela 709 virtual
+        F["Area_RE"] = F["Rrs_709"]
+
+    # FLH(678) — proxy físico importante
+    if {"Rrs_678","Rrs_667","Rrs_748"}.issubset(B.columns):
+        frac = (678 - 667) / (748 - 667)
+        cont = B["Rrs_667"] + (B["Rrs_748"] - B["Rrs_667"]) * frac
+        F["FLH_678"] = B["Rrs_678"] - cont
+    elif {"Rrs_678","Rrs_667"}.issubset(B.columns):
+        F["FLH_678"] = B["Rrs_678"] - B["Rrs_667"]
+
+    # Áreas (janelas) factíveis no MODIS
+    def _area(cols):
+        cols = [c for c in cols if c in B.columns]
+        return B[cols].sum(axis=1) if cols else np.full(len(B), np.nan)
+    F["Area_Blue"]  = _area(["Rrs_443","Rrs_488"])
+    F["Area_Green"] = _area(["Rrs_531","Rrs_547"])
+    F["Area_Red"]   = _area(["Rrs_667","Rrs_678"])
+
+    # Derivadas sobre bandas disponíveis (ordenadas por nm; incluir 709 virtual se existir)
+    cols_sorted = sorted([c for c in list(B.columns) + (["Rrs_709"] if "Rrs_709" in F.columns else []) if c.startswith("Rrs_")],
+                         key=lambda c: int(c.split("_")[1]))
+    if "Rrs_709" in F.columns:
+        arr = pd.concat([B, F[["Rrs_709"]]], axis=1)[cols_sorted].values
+    else:
+        arr = B[cols_sorted].values
+    if arr.shape[1] >= 3:
+        d1 = np.diff(arr, axis=1); d2 = np.diff(arr, n=2, axis=1)
+        F["d1_mean"] = np.nanmean(d1, axis=1); F["d1_p95"] = np.nanpercentile(d1, 95, axis=1)
+        F["d2_mean"] = np.nanmean(d2, axis=1); F["d2_p95"] = np.nanpercentile(d2, 95, axis=1)
+
+else:
+    # ===== BLOCO ORIGINAL (OLCI/MERIS/hiper) =====
+    F = B.copy()
+    if "Rrs_560" in B.columns:
+        for c in B.columns: F[c+"_norm560"] = B[c] / (B["Rrs_560"] + 1e-12)
+    F["norm_Rrs_L1"] = B.sum(axis=1) + 1e-12
+    for c in B.columns: F[c+"_normL1"] = B[c] / F["norm_Rrs_L1"]
+
+    # índices relevantes
+    if {"Rrs_708","Rrs_665"}.issubset(B.columns): F["NDCI"] = safe_ratio(B["Rrs_708"], B["Rrs_665"])
+    if {"Rrs_681","Rrs_665"}.issubset(B.columns): F["Red_a"] = safe_ratio(B["Rrs_681"], B["Rrs_665"])
+    if {"Rrs_560","Rrs_490"}.issubset(B.columns): F["G_over_B"] = B["Rrs_560"] / (B["Rrs_490"] + 1e-12)
+    if {"Rrs_490","Rrs_665"}.issubset(B.columns): F["B_over_R"] = B["Rrs_490"] / (B["Rrs_665"] + 1e-12)
+    if {"Rrs_709","Rrs_681"}.issubset(B.columns): F["RedEdgeSlope"] = B["Rrs_709"] - B["Rrs_681"]
+    if {"Rrs_700","Rrs_665"}.issubset(B.columns): F["RedPeakMinusR"] = B["Rrs_700"] - B["Rrs_665"]
+    if {"Rrs_705","Rrs_681"}.issubset(B.columns): F["Slope_681_705"] = B["Rrs_705"] - B["Rrs_681"]
+
+    F["Area_Blue"]  = window_sum(B, 440, 500, band_core)
+    F["Area_Green"] = window_sum(B, 520, 580, band_core)
+    F["Area_Red"]   = window_sum(B, 650, 700, band_core)
+    F["Area_RE"]    = window_sum(B, 700, 710, band_core)
+
+    d1 = first_derivative(B); d2 = second_derivative(B)
+    for k,v in d1.items(): F[k] = v
+    for k,v in d2.items(): F[k] = v
+
+# Limpeza (igual)
 F = F.replace([np.inf,-np.inf], np.nan)
 for c in F.columns: F[c] = F[c].fillna(F[c].median())
 
