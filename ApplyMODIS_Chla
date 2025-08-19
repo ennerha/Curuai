@@ -5,6 +5,8 @@
 # - COMPOSITE: "median" (padrão) ou "mean"
 # - Inversão ln1p -> expm1
 # - Prévia PNG e quantis por mês
+# - Aplicando SOMENTE o melhor modelo: SVR_Optuna [Global]
+#   (/content/artifacts_curuai/curuai_svr_global.pkl)
 # ============================================================
 
 # !pip -q install earthengine-api rasterio joblib numpy pandas matplotlib geopandas shapely fiona pyproj requests tqdm
@@ -72,8 +74,8 @@ FORCE_UNMASK_IN_LOOSE= True
 TARGET_CRS   = "EPSG:4326"
 TARGET_SCALE = 500                 # metros
 
-P_TWO_STAGE = "/content/artifacts_curuai/curuai_two_stage.pkl"
-P_SVR_GLOB  = "/content/artifacts_curuai/curuai_svr_global.pkl"
+# >>> SOMENTE ESTE MODELO será aplicado <<<
+P_SVR_GLOB  = "/content/artifacts_curuai/curuai_svr_global.pkl"  # SVR_Optuna [Global]
 PRED_INVERSE = "ln1p"              # treino em log1p → aplicar expm1
 
 MAX_PIXELS     = 1e13
@@ -82,6 +84,7 @@ MAX_ERROR_M    = 100
 NODATA_PRED    = -9999.0
 VERBOSE        = True
 
+# Bandas SR do MOD09GA/MYD09GA (500 m)
 SR_BANDS     = ["sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07"]
 QA_BAND_1KM  = "state_1km"
 QA_BAND_500M = "sur_refl_qc_500m"
@@ -103,7 +106,7 @@ init_ee()
 
 # ---------------- ROI do shapefile (fix topo) ----------------
 def load_roi_gdf(shp_path=SHP_PATH, override_crs=ROI_CRS_OVERRIDE):
-    with fiona.Env(SHAPE_RESTORE_SHX='YES'):              # <<< corrigido: usar fiona.Env
+    with fiona.Env(SHAPE_RESTORE_SHX='YES'):
         gdf = gpd.read_file(shp_path)
     if override_crs is not None:
         gdf = gdf.set_crs(override_crs, allow_override=True)
@@ -181,50 +184,213 @@ def make_mosaic(ic):
     return mos.clip(ROI_EE).reproject(TARGET_CRS, None, TARGET_SCALE)
 
 # ---------------- Features a partir do mosaico ----------------
+# Proxies para nomes "Rrs_*" esperados pelo modelo
 MODIS_TO_RRS = {
-    "Rrs_443": "sur_refl_b03",
+    "Rrs_443": "sur_refl_b03",  # 459–479 (proxy de 443/490)
     "Rrs_490": "sur_refl_b03",
-    "Rrs_510": "sur_refl_b04",
+    "Rrs_510": "sur_refl_b04",  # 545–565
     "Rrs_560": "sur_refl_b04",
-    "Rrs_620": "sur_refl_b01",
+    "Rrs_620": "sur_refl_b01",  # 620–670
     "Rrs_665": "sur_refl_b01",
 }
 
 def build_features_image(mosaic, feature_names):
+    """
+    Gera APENAS as features pedidas em 'feature_names'.
+    Mantém comportamento atual e adiciona:
+      - Rrs_709 virtual (extrap. de b04->b01)
+      - Rrs_681 / Rrs_700 / Rrs_705 / Rrs_708 VIRTUAIS (interp. entre 665 e 709 virtual)
+      - NDCI (709v e 665)
+      - Red_a (com 681v e 665; fallback 0)
+      - RedEdgeSlope (preferência: 709v - 681v; fallback: 709v - 665)
+      - Slope_681_705 (705v - 681v)
+      - RedPeakMinusR (700v - 665)
+      - *_norm547 (se aparecer), derivadas d1/d2, áreas
+    """
     base = {b: mosaic.select(b) for b in SR_BANDS}
-    proxies = {k: base[v] for k, v in MODIS_TO_RRS.items()}
+    proxies = {k: base[v] for k, v in MODIS_TO_RRS.items() if v in base}
 
     def safe_div(a,b): return a.divide(b.add(1e-12))
-    def sum_bands(lst):
+    def safe_ratio(a,b): return a.subtract(b).divide(a.add(b).add(1e-12))
+    def safe_add(lst):
+        if not lst: return None
         out = lst[0]
         for im in lst[1:]: out = out.add(im)
-        return out.add(1e-12)
+        return out
+    def sum_bands(lst):
+        s = safe_add(lst)
+        return s.add(1e-12) if s is not None else None
+
     L1 = sum_bands([base[b] for b in SR_BANDS])
+
+    # --- 709 virtual (fallback simples) ---
+    Rrs_709 = None
+    if all(b in base for b in ("sur_refl_b01","sur_refl_b04")):
+        lam1, lam2, lamT = 560.0, 665.0, 709.0
+        slope = base["sur_refl_b01"].subtract(base["sur_refl_b04"]).divide((lam2 - lam1) + 1e-12)
+        Rrs_709 = base["sur_refl_b04"].add(slope.multiply(lamT - lam1)).max(0)
+
+    # --- virtuais 681/700/705/708 por interpolação entre 665 (b01) e 709 virtual ---
+    def lerp_665_to_709(lambda_nm):
+        if (Rrs_709 is None) or ("sur_refl_b01" not in base): 
+            return None
+        t = (lambda_nm - 665.0) / (709.0 - 665.0)
+        return base["sur_refl_b01"].add( Rrs_709.subtract(base["sur_refl_b01"]).multiply(t) ).max(0)
+
+    Rrs_681 = lerp_665_to_709(681.0)
+    Rrs_700 = lerp_665_to_709(700.0)
+    Rrs_705 = lerp_665_to_709(705.0)
+    Rrs_708 = lerp_665_to_709(708.0)
+
+    def norm_by_547(img):
+        return img.divide(base["sur_refl_b04"].add(1e-12)) if "sur_refl_b04" in base else None
+
+    # Derivadas (b03, b04, b01, +709v)
+    band_name_to_nm = {
+        "sur_refl_b03": 470, "sur_refl_b04": 555, "sur_refl_b01": 650, "Rrs_709": 709
+    }
+    bands_for_deriv = []
+    for b in ["sur_refl_b03","sur_refl_b04","sur_refl_b01"]:
+        if b in base: bands_for_deriv.append((band_name_to_nm[b], base[b]))
+    if Rrs_709 is not None:
+        bands_for_deriv.append((709, Rrs_709))
+    bands_for_deriv = sorted(bands_for_deriv, key=lambda t: t[0])
+
+    def deriv_stats(img_list):
+        if len(img_list) < 3: 
+            return None, None, None, None
+        stack = ee.Image.cat([im for _, im in img_list])
+        d1_list = []
+        for i in range(1, len(img_list)):
+            d1_list.append(stack.select(i).subtract(stack.select(i-1)))
+        d1 = ee.Image.cat(d1_list)
+        d1_mean = d1.reduce(ee.Reducer.mean())
+        d1_p95  = d1.reduce(ee.Reducer.percentile([95])).rename(d1_mean.bandNames())
+        if len(d1_list) < 2:
+            return d1_mean, d1_p95, None, None
+        d2_list = []
+        for i in range(1, len(d1_list)):
+            d2_list.append(d1_list[i].subtract(d1_list[i-1]))
+        d2 = ee.Image.cat(d2_list)
+        d2_mean = d2.reduce(ee.Reducer.mean())
+        d2_p95  = d2.reduce(ee.Reducer.percentile([95])).rename(d2_mean.bandNames())
+        return d1_mean, d1_p95, d2_mean, d2_p95
+
+    d1_mean_img, d1_p95_img, d2_mean_img, d2_p95_img = deriv_stats(bands_for_deriv)
 
     bands = []
     for fname in feature_names:
         img = None
+
+        # Rrs_* diretos (proxies) e Rrs_* virtuais
         if fname in proxies:
             img = proxies[fname].rename(fname)
+        elif fname == "Rrs_709" and (Rrs_709 is not None):
+            img = Rrs_709.rename(fname)
+        elif fname == "Rrs_681" and (Rrs_681 is not None):
+            img = Rrs_681.rename(fname)
+        elif fname == "Rrs_700" and (Rrs_700 is not None):
+            img = Rrs_700.rename(fname)
+        elif fname == "Rrs_705" and (Rrs_705 is not None):
+            img = Rrs_705.rename(fname)
+        elif fname == "Rrs_708" and (Rrs_708 is not None):
+            img = Rrs_708.rename(fname)
+
+        # normalizações
         elif fname.endswith("_norm560"):
             stem = fname.replace("_norm560","")
-            if (stem in proxies) and ("Rrs_560" in proxies):
-                img = safe_div(proxies[stem], proxies["Rrs_560"]).rename(fname)
-        elif fname == "norm_Rrs_L1":
+            base_img = None
+            if stem in proxies: base_img = proxies[stem]
+            elif stem == "Rrs_681": base_img = Rrs_681
+            elif stem == "Rrs_700": base_img = Rrs_700
+            elif stem == "Rrs_705": base_img = Rrs_705
+            elif stem == "Rrs_709": base_img = Rrs_709
+            elif stem == "Rrs_708": base_img = Rrs_708
+            if (base_img is not None) and ("Rrs_560" in proxies):
+                img = safe_div(base_img, proxies["Rrs_560"]).rename(fname)
+
+        elif fname.endswith("_norm547"):
+            stem = fname.replace("_norm547","")
+            base_img = None
+            if stem in proxies: base_img = proxies[stem]
+            elif stem == "Rrs_681": base_img = Rrs_681
+            elif stem == "Rrs_700": base_img = Rrs_700
+            elif stem == "Rrs_705": base_img = Rrs_705
+            elif stem == "Rrs_709": base_img = Rrs_709
+            elif stem == "Rrs_708": base_img = Rrs_708
+            if (base_img is not None) and ("sur_refl_b04" in base):
+                tmp = norm_by_547(base_img)
+                if tmp is not None: img = tmp.rename(fname)
+
+        elif fname == "norm_Rrs_L1" and L1 is not None:
             img = L1.rename(fname)
-        elif fname.endswith("_normL1"):
+        elif fname.endswith("_normL1") and L1 is not None:
             stem = fname.replace("_normL1","")
-            if stem in proxies:
-                img = safe_div(proxies[stem], L1).rename(fname)
-        elif fname == "G_over_B":
+            base_img = None
+            if stem in proxies: base_img = proxies[stem]
+            elif stem == "Rrs_681": base_img = Rrs_681
+            elif stem == "Rrs_700": base_img = Rrs_700
+            elif stem == "Rrs_705": base_img = Rrs_705
+            elif stem == "Rrs_709": base_img = Rrs_709
+            elif stem == "Rrs_708": base_img = Rrs_708
+            if base_img is not None:
+                img = safe_div(base_img, L1).rename(fname)
+
+        # índices
+        elif fname == "G_over_B" and all(b in base for b in ("sur_refl_b04","sur_refl_b03")):
             img = safe_div(base["sur_refl_b04"], base["sur_refl_b03"]).rename(fname)
-        elif fname == "B_over_R":
+        elif fname == "B_over_R" and all(b in base for b in ("sur_refl_b03","sur_refl_b01")):
             img = safe_div(base["sur_refl_b03"], base["sur_refl_b01"]).rename(fname)
+        elif fname == "NDCI" and (Rrs_709 is not None) and ("sur_refl_b01" in base):
+            num = Rrs_709.subtract(base["sur_refl_b01"])
+            den = Rrs_709.add(base["sur_refl_b01"]).add(1e-12)
+            img = num.divide(den).rename(fname)
         elif fname == "Red_a":
-            img = ee.Image(0).rename(fname)
+            if (Rrs_681 is not None) and ("sur_refl_b01" in base):
+                img = safe_ratio(Rrs_681, base["sur_refl_b01"]).rename(fname)
+            else:
+                img = ee.Image(0).rename(fname)
+        elif fname == "RedEdgeSlope":
+            if (Rrs_709 is not None) and (Rrs_681 is not None):
+                img = Rrs_709.subtract(Rrs_681).rename(fname)
+            elif (Rrs_709 is not None) and ("sur_refl_b01" in base):
+                img = Rrs_709.subtract(base["sur_refl_b01"]).rename(fname)
+
+        # métricas solicitadas no warn
+        elif fname == "Slope_681_705" and (Rrs_681 is not None) and (Rrs_705 is not None):
+            img = Rrs_705.subtract(Rrs_681).rename(fname)
+        elif fname == "RedPeakMinusR" and (Rrs_700 is not None) and ("sur_refl_b01" in base):
+            img = Rrs_700.subtract(base["sur_refl_b01"]).rename(fname)
+
+        # áreas
+        elif fname == "Area_Blue":
+            comp = sum_bands([base[b] for b in ["sur_refl_b03"] if b in base])
+            if comp is not None: img = comp.rename(fname)
+        elif fname == "Area_Green":
+            comp = sum_bands([base[b] for b in ["sur_refl_b04"] if b in base])
+            if comp is not None: img = comp.rename(fname)
+        elif fname == "Area_Red":
+            comp = sum_bands([base[b] for b in ["sur_refl_b01"] if b in base])
+            if comp is not None: img = comp.rename(fname)
+        elif fname == "Area_RE" and (Rrs_709 is not None):
+            img = Rrs_709.rename(fname)
+
+        # derivadas
+        elif fname == "d1_mean" and (d1_mean_img is not None):
+            img = d1_mean_img.rename(fname)
+        elif fname == "d1_p95" and (d1_p95_img is not None):
+            img = d1_p95_img.rename(fname)
+        elif fname == "d2_mean" and (d2_mean_img is not None):
+            img = d2_mean_img.rename(fname)
+        elif fname == "d2_p95" and (d2_p95_img is not None):
+            img = d2_p95_img.rename(fname)
+
+        # fallback: banda constante 0 (não quebra)
         if img is None:
             img = ee.Image(0).rename(fname)
+
         bands.append(img)
+
     return ee.Image.cat(bands).reproject(TARGET_CRS, None, TARGET_SCALE)
 
 # ---------------- Export one-shot ----------------
@@ -254,13 +420,12 @@ def roi_mask_array_like(dataset):
                      fill=0, all_touched=True, dtype="uint8").astype(bool)
     return mask
 
-# ---------------- Modelo ----------------
+# ---------------- Modelo (SOMENTE SVR GLOBAL) ----------------
 def load_model():
-    if Path(P_TWO_STAGE).exists():
-        M = joblib.load(P_TWO_STAGE); return "two", M, M["features"]
     if Path(P_SVR_GLOB).exists():
-        M = joblib.load(P_SVR_GLOB);  return "svr", M, M["features"]
-    raise RuntimeError("Nenhum modelo encontrado em /content/artifacts_curuai/")
+        M = joblib.load(P_SVR_GLOB)
+        return "svr", M, M["features"]
+    raise RuntimeError("Modelo SVR global não encontrado em: " + P_SVR_GLOB)
 
 def inverse_transform(y):
     if PRED_INVERSE == "ln1p":
@@ -292,16 +457,7 @@ def predict_from_features_tif(tif_path, model_kind, M, nodata_out=NODATA_PRED):
         if finite.any():
             Xc  = X[finite]
             idx = np.where(valid)[0][finite]
-            if model_kind == "two":
-                clf = M["classifier"]; low = M["low_regressor"]; high = M["high_regressor"]
-                c = clf.predict(Xc).astype(int)
-                yhat = np.empty(Xc.shape[0], dtype="float32")
-                m0 = (c == 0); m1 = ~m0
-                if m0.any():  yhat[m0] = low.predict(Xc[m0]).astype("float32")
-                if m1.any():  yhat[m1] = high.predict(Xc[m1]).astype("float32")
-                y_log[idx] = yhat
-            else:
-                y_log[idx] = M["model"].predict(Xc).astype("float32")
+            y_log[idx] = M["model"].predict(Xc).astype("float32")
 
     y_lin = inverse_transform(y_log.astype("float64"))
     pred  = y_lin.reshape(H, W).astype("float32")
@@ -351,7 +507,29 @@ def print_quantiles(tif_path):
 # ---------------- Main ----------------
 def main():
     model_kind, M, FEATURE_LIST = load_model()
-    log(f"[MODEL] tipo={model_kind}  |  #features={len(FEATURE_LIST)}  |  Project EE: {EE_PROJECT}")
+    log(f"[MODEL] tipo={model_kind} (SVR_Optuna [Global]) | #features={len(FEATURE_LIST)} | EE Project: {EE_PROJECT}")
+    log(f"[MODEL] caminho: {P_SVR_GLOB}")
+    log(f"[MODEL] primeiras features ({min(10, len(FEATURE_LIST))}): {FEATURE_LIST[:10]}")
+
+    # Checagem leve de compatibilidade (apenas log; não quebra o fluxo)
+    GEN_CAPS = {
+        "Rrs_443","Rrs_490","Rrs_510","Rrs_560","Rrs_620","Rrs_665",
+        "Rrs_681","Rrs_700","Rrs_705","Rrs_708","Rrs_709",
+        "norm_Rrs_L1","G_over_B","B_over_R","Red_a","NDCI","RedEdgeSlope",
+        "Area_Blue","Area_Green","Area_Red","Area_RE",
+        "Slope_681_705","RedPeakMinusR",
+        "d1_mean","d1_p95","d2_mean","d2_p95"
+    }
+    SUPPORTS_SUFFIX = ("_norm560","_norm547","_normL1")
+    def _is_supported(fname):
+        if fname in GEN_CAPS: return True
+        if fname.endswith(SUPPORTS_SUFFIX): return True
+        return False
+    missing = [f for f in FEATURE_LIST if not _is_supported(f)]
+    if missing:
+        log("[WARN] Algumas features do modelo não têm geração explícita para MOD09GA; serão preenchidas com 0:")
+        for f in missing[:25]: log("   - " + f)
+
     months = MONTHS_FILTER if MONTHS_FILTER else list(range(1,13))
 
     for year in range(START_YEAR, END_YEAR+1):
@@ -375,7 +553,7 @@ def main():
                 export_image_to_tif(feats_im, str(feats_tif), region=ROI_EE, scale=TARGET_SCALE, crs=TARGET_CRS)
                 log(f"[export] {feats_tif}")
 
-                log(f"[{ym}] predizendo...")
+                log(f"[{ym}] predizendo (SVR)...")
                 pred_path = predict_from_features_tif(str(feats_tif), model_kind, M)
                 log(f"[pred]   {pred_path}")
 
