@@ -1,0 +1,294 @@
+# ==============================================
+# Estações do ano — plot 2×2 (versão alinhada)
+# - extent com plotting_extent (sem origin="upper")
+# - máscara da ROI por rasterização (grid-alinhado)
+# - contorno usa as mesmas geometrias da máscara
+# ==============================================
+
+import os, re, glob, warnings
+from pathlib import Path
+import numpy as np
+import rasterio as rio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FormatStrFormatter
+import fiona
+
+# garante restauração de .shx ausente quando possível
+import os as _os_envfix
+_os_envfix.environ.setdefault("SHAPE_RESTORE_SHX", "YES")
+
+# ================= Auto-deps (Colab-safe) =================
+import importlib, sys, subprocess
+
+def _ensure(pkg, import_name=None):
+    name = import_name or pkg.split('==')[0].split('>=')[0]
+    try:
+        importlib.import_module(name)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+for pkg, imp in [
+    ("geopandas>=0.12","geopandas"),
+    ("fiona>=1.9","fiona"),
+    ("pyproj>=3.5","pyproj"),
+    ("shapely>=2.0","shapely"),
+    ("pyshp>=2.3","shapefile"),
+]:
+    try:
+        _ensure(pkg, imp)
+    except Exception:
+        pass
+
+# ================= Config =================
+PRED_DIR = "/content/artifacts_curuai_modis_only/pred"
+OUT_DIR  = Path("/content/artifacts_curuai_modis_only/plots"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_FIG  = OUT_DIR / "chla_seasons.png"
+
+# Defina o shapefile (ou .zip/.gpkg/.geojson)
+SHP_PATH = "/content/Curuai.shp"
+
+# Se o shapefile vier sem PRJ (gdf.crs == None), defina o EPSG correto aqui:
+ROI_CRS_OVERRIDE = None         # ex.: "EPSG:4326" ou "EPSG:4674"
+ALL_TOUCHED = True              # rasterização encostando nos limites
+
+FORCE_MASK = True               # aplica máscara pela ROI
+DRAW_OUTLINE = True             # desenha contorno da ROI
+YEAR = None                     # None = escolhe ano mais recente com todos os meses; ou defina ex.: 2016
+
+# Datas sazonais pedidas (Hemisfério Sul)
+SEASONS = [
+    ("(a) Outono — 20 mar", 3),
+    ("(b) Inverno — 20 jun", 6),
+    ("(c) Primavera — 22 set", 9),
+    ("(d) Verão — 21 dez", 12),
+]
+
+warnings.filterwarnings("ignore", message="CPLE_AppDefined")
+warnings.filterwarnings("ignore", category=UserWarning, module="rasterio")
+
+# ================= Utils =================
+def _resolve_roi_path(path_hint: str) -> str:
+    p = Path(path_hint)
+    if p.exists():
+        return str(p)
+    for ext in [".zip", ".gpkg", ".geojson", ".json"]:
+        alt = p.with_suffix(ext)
+        if alt.exists():
+            return str(alt)
+    for ext in [".shp", ".zip", ".gpkg", ".geojson", ".json"]:
+        cand = list(p.parent.glob(p.stem + "*" + ext))
+        if cand:
+            return str(cand[0])
+    return str(path_hint)
+
+ROI_PATH = _resolve_roi_path(SHP_PATH)
+print(f"[ROI] Usando arquivo: {ROI_PATH}")
+
+def list_monthly_files(pred_dir):
+    files = sorted(glob.glob(os.path.join(pred_dir, "curuai_chla_*.tif")))
+    ym_re = re.compile(r"curuai_chla_(\d{4})-(\d{2})\.tif$")
+    recs = []
+    for f in files:
+        m = ym_re.search(os.path.basename(f))
+        if not m:
+            continue
+        y, mo = int(m.group(1)), int(m.group(2))
+        recs.append((y, mo, f))
+    return recs
+
+# >>> usar plotting_extent (em vez de bounds bruto) para o imshow
+from rasterio.plot import plotting_extent
+
+def open_raster(path):
+    with rio.open(path) as ds:
+        arr = ds.read(1, masked=True)
+        extent = plotting_extent(ds)   # (xmin, xmax, ymin, ymax) coerente com a affine (dy<0 etc.)
+        transform = ds.transform
+        crs = ds.crs
+    return arr, extent, transform, crs
+
+# ======= ROI: ler “estrito” + transformar com rasterio.warp + rasterizar =======
+import geopandas as gpd
+from shapely.geometry import shape as shp_shape, mapping
+from rasterio.warp import transform_geom
+from rasterio.features import rasterize
+
+def _load_roi_geoms_strict(shp_path, crs_override=None):
+    with fiona.Env(SHAPE_RESTORE_SHX='YES'):
+        gdf = gpd.read_file(shp_path)
+    if gdf.empty:
+        raise RuntimeError(f"ROI vazia em {shp_path}")
+    if crs_override is not None:
+        gdf = gdf.set_crs(crs_override, allow_override=True)
+    if gdf.crs is None:
+        raise RuntimeError("A ROI não tem CRS. Defina ROI_CRS_OVERRIDE com o EPSG correto.")
+    geoms = [g for g in gdf.geometry if g is not None and not g.is_empty]
+    return geoms, gdf.crs
+
+def _roi_to_raster_crs(geoms, src_crs, raster_crs):
+    src = src_crs.to_string() if hasattr(src_crs, "to_string") else str(src_crs)
+    dst = raster_crs.to_string() if hasattr(raster_crs, "to_string") else str(raster_crs)
+    return [transform_geom(src, dst, mapping(g), precision=6) for g in geoms]
+
+def mask_with_roi_rasterize(arr, transform, raster_crs, shp_path=ROI_PATH):
+    geoms, src_crs = _load_roi_geoms_strict(shp_path, ROI_CRS_OVERRIDE)
+    geoms_tx = _roi_to_raster_crs(geoms, src_crs, raster_crs)
+    roi_mask = rasterize(
+        [(g, 1) for g in geoms_tx],
+        out_shape=arr.shape,
+        transform=transform,
+        fill=0,
+        all_touched=ALL_TOUCHED,
+        dtype="uint8"
+    ).astype(bool)
+    combined_mask = np.logical_or(getattr(arr, 'mask', np.zeros(arr.shape, bool)), ~roi_mask)
+    return np.ma.array(arr, mask=combined_mask), geoms_tx  # retorna também as geometrias projetadas
+
+def pick_best_year(records, months_needed):
+    years = sorted({y for y,_,_ in records}, reverse=True)
+    monthset_by_year = {y: set(m for yy,m,_ in records if yy==y) for y in years}
+    for y in years:
+        if set(months_needed).issubset(monthset_by_year[y]):
+            return y
+    return None
+
+def climatology_month(records, month):
+    stacks = []
+    ref_shape = ref_extent = ref_transform = ref_crs = None
+    for y, m, f in records:
+        if m != month:
+            continue
+        arr, extent, transform, crs = open_raster(f)
+        if ref_shape is None:
+            ref_shape, ref_extent, ref_transform, ref_crs = arr.shape, extent, transform, crs
+            stacks.append(arr)
+        else:
+            if arr.shape == ref_shape and extent == ref_extent:
+                stacks.append(arr)
+    if len(stacks) == 0:
+        return None, None, None, None, "sem dados"
+    data = np.ma.array(stacks)
+    med = np.ma.median(data, axis=0)
+    return med, ref_extent, ref_transform, ref_crs, "climatologia"
+
+# ================= Carrega e organiza =================
+records = list_monthly_files(PRED_DIR)
+if not records:
+    raise RuntimeError(f"Nenhum GeoTIFF mensal encontrado em {PRED_DIR} (esperado: curuai_chla_YYYY-MM.tif).")
+
+print(f"[INFO] Encontrados {len(records)} arquivos raster:")
+for y, m, f in records[:5]:
+    print(f"  {y}-{m:02d}: {os.path.basename(f)}")
+if len(records) > 5:
+    print(f"  ... e mais {len(records)-5} arquivos")
+
+months_needed = [m for _, m in SEASONS]
+arrs, extents, transforms, crss, tags = [], [], [], [], []
+
+if YEAR is None:
+    y_best = pick_best_year(records, months_needed)
+    if y_best is not None:
+        print(f"[INFO] Usando ano {y_best} (contém todos os meses necessários)")
+        for label, mo in SEASONS:
+            path = [f for y,m,f in records if y==y_best and m==mo][0]
+            arr, extent, transform, crs = open_raster(path)
+            arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(f"{y_best:04d}-{mo:02d}")
+    else:
+        print("[INFO] Nenhum ano único contém todos os meses. Usando climatologia.")
+        for label, mo in SEASONS:
+            arr, extent, transform, crs, tag = climatology_month(records, mo)
+            if arr is None:
+                raise RuntimeError(f"Sem dados para o mês {mo:02d} em nenhum ano para montar a climatologia.")
+            arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(tag)
+else:
+    print(f"[INFO] Usando ano específico: {YEAR}")
+    for label, mo in SEASONS:
+        match = [f for y,m,f in records if y==YEAR and m==mo]
+        if not match:
+            raise RuntimeError(f"Arquivo para {YEAR}-{mo:02d} não encontrado em {PRED_DIR}.")
+        arr, extent, transform, crs = open_raster(match[0])
+        arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(f"{YEAR:04d}-{mo:02d}")
+
+# ================= Aplicar máscara (rasterização alinhada ao grid) =================
+masked_arrs = []
+geoms_tx_plot = None
+if FORCE_MASK:
+    try:
+        for i, (arr, tr, crs) in enumerate(zip(arrs, transforms, crss)):
+            masked_arr, geoms_tx = mask_with_roi_rasterize(arr, tr, crs, ROI_PATH)
+            masked_arrs.append(masked_arr)
+            if geoms_tx_plot is None:
+                geoms_tx_plot = geoms_tx  # guarda uma versão para desenhar o contorno
+    except Exception as e:
+        print(f"[AVISO] Falha ao aplicar máscara da ROI ({e}). Continuando sem máscara.")
+        masked_arrs = arrs
+else:
+    masked_arrs = arrs
+
+# ================= Escala de cores (robusta 2–98%) =================
+all_vals = []
+for a in masked_arrs:
+    vals_i = a.compressed() if hasattr(a, 'compressed') else a[~np.isnan(a)]
+    if np.size(vals_i) > 0:
+        all_vals.append(vals_i)
+
+if len(all_vals) == 0:
+    # fallback: usar arrays originais sem máscara
+    all_vals = []
+    for a in arrs:
+        vals_i = a.compressed() if hasattr(a, 'compressed') else a[~np.isnan(a)]
+        if np.size(vals_i) > 0:
+            all_vals.append(vals_i)
+    if len(all_vals) == 0:
+        raise RuntimeError("Sem valores válidos nos rasters (mesmo sem máscara).")
+
+vals = np.concatenate(all_vals)
+vmin, vmax = np.percentile(vals, (2, 98))
+if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+    vmax = float(np.nanmax(vals)); vmin = max(0.0, float(np.nanmin(vals)))
+    if not np.isfinite(vmax) or vmax == vmin:
+        vmax = vmin + 1e-6
+cticks = np.linspace(vmin, vmax, 6)
+
+# ================= Plot 2×2 =================
+fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
+
+# contorno da ROI (opcional): usa as MESMAS geometrias projetadas da máscara
+roi_outline = None
+if DRAW_OUTLINE and geoms_tx_plot is not None:
+    try:
+        roi_outline = gpd.GeoDataFrame(
+            geometry=[shp_shape(g) for g in geoms_tx_plot],
+            crs=crss[0] if len(crss) > 0 else None
+        )
+        print("[INFO] Contorno da ROI preparado para desenho")
+    except Exception as e:
+        print(f"[AVISO] Falha ao preparar contorno da ROI: {e}")
+        roi_outline = None
+
+for ax, (label, _mo), arr, extent, tr, crs, tag in zip(axes.flat, SEASONS, masked_arrs, extents, transforms, crss, tags):
+    # >>> sem origin="upper"; extent já reflete a affine
+    im = ax.imshow(arr, extent=extent, vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
+    ax.set_title(f"{label} — {tag}", fontsize=11)
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_aspect("equal")
+    if roi_outline is not None and crs is not None:
+        try:
+            gdf_plot = roi_outline if str(roi_outline.crs) == str(crs) else roi_outline.to_crs(crs)
+            gdf_plot.boundary.plot(ax=ax, linewidth=1.2, edgecolor="black")
+        except Exception as e:
+            print(f"[AVISO] Falha ao desenhar contorno no subplot: {e}")
+
+# barra de cores única
+cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02, ticks=cticks)
+cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+cbar.set_label("Clorofila-a (mg/m³)")
+
+fig.suptitle("Lago Curuai - Clorofila-a (MODIS)\nMosaicos mensais nos equinócios/solstícios do Hemisfério Sul", fontsize=13)
+
+plt.savefig(OUT_FIG, dpi=220)
+plt.close(fig)
+
+print(f"Figura salva em: {OUT_FIG}")
