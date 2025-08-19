@@ -1,0 +1,231 @@
+# ============================================================
+# Análises temporais sobre as predições mensais (GeoTIFFs)
+# - Série temporal da média espacial (e estatísticas)
+# - Boxplots temporais (por mês) e anuais (opcional)
+# - Tendência (Mann-Kendall sazonal, Theil–Sen, OLS)
+# - Decomposição STL, anomalias, ACF, histograma
+# - Salva CSV e figuras
+# ============================================================
+
+!pip -q install numpy pandas rasterio geopandas statsmodels pymannkendall matplotlib
+
+import os, re, glob, math, warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import rasterio as rio
+import matplotlib.pyplot as plt
+from datetime import datetime
+from statsmodels.tsa.seasonal import STL
+import statsmodels.api as sm
+import pymannkendall as mk
+
+warnings.filterwarnings("ignore")
+
+# ---------------- Config ----------------
+# Ajuste este caminho para a pasta das predições (GeoTIFFs)
+# Ex.: "/content/artifacts_curuai_modis_only/pred" ou "/content/artifacts_curuai_modis/pred"
+PRED_DIR = "/content/artifacts_curuai_modis_only/pred"
+
+# Nome esperado: curuai_chla_YYYY-MM.tif (do seu script de aplicação)
+PATTERN  = "curuai_chla_*.tif"
+NODATA   = -9999.0
+
+OUT_DIR  = Path("/content/analysis_plots"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+CSV_OUT  = OUT_DIR / "curuai_timeseries_monthly_stats.csv"
+
+# Se desejar boxplot anual da distribuição espacial, defina:
+DO_YEARLY_SPATIAL_BOXPLOTS = False     # True para gerar (custo de E/S pode ser grande)
+
+# ---------------- Utils ----------------
+def parse_year_month_from_name(name: str):
+    # Busca YYYY-MM no nome do arquivo
+    m = re.search(r"(\d{4})-(\d{2})", name)
+    if not m: 
+        return None
+    y, mo = int(m.group(1)), int(m.group(2))
+    return y, mo
+
+def read_valid_array(path, band=1, nodata=NODATA):
+    with rio.open(path) as ds:
+        a = ds.read(band).astype("float64")
+    m = (a != nodata) & np.isfinite(a)
+    return a[m]
+
+# ---------------- Coleta estatísticas mensais (espaciais) ----------------
+files = sorted(glob.glob(str(Path(PRED_DIR) / PATTERN)))
+rows = []
+for fp in files:
+    ym = parse_year_month_from_name(Path(fp).name)
+    if ym is None:
+        continue
+    y, m = ym
+    v = read_valid_array(fp, nodata=NODATA)
+    if v.size == 0:
+        continue
+    rows.append({
+        "date": pd.Timestamp(year=y, month=m, day=1),
+        "year": y, "month": m,
+        "mean": float(np.mean(v)),
+        "median": float(np.median(v)),
+        "std": float(np.std(v)),
+        "p10": float(np.percentile(v, 10)),
+        "p25": float(np.percentile(v, 25)),
+        "p50": float(np.percentile(v, 50)),
+        "p75": float(np.percentile(v, 75)),
+        "p90": float(np.percentile(v, 90)),
+        "n_valid": int(v.size)
+    })
+
+if not rows:
+    raise RuntimeError(f"Nenhum arquivo encontrado em {PRED_DIR} com padrão {PATTERN}.")
+
+df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+df.to_csv(CSV_OUT, index=False)
+print(f"[OK] Estatísticas mensais salvas em: {CSV_OUT}")
+
+# Série principal (média espacial mensal)
+ts = df.set_index("date")["mean"].asfreq("MS")  # Monthly Start
+# Prevenção: gaps → opcional (interpolação leve só para fins de gráficos/ACF/STL)
+ts_interp = ts.interpolate(limit_direction="both")
+
+# ---------------- Gráfico 1: Série temporal da média (com média móvel e tendência) ----------------
+plt.figure(figsize=(11,4.5))
+plt.plot(ts.index, ts.values, lw=1.5, label="Monthly spatial mean")
+plt.plot(ts_interp.index, ts_interp.rolling(3, center=True).mean(), lw=2.0, label="3-mo rolling mean")
+plt.xlabel("Date"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Curuai — Monthly spatial mean chlorophyll-a")
+plt.grid(alpha=0.25)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUT_DIR / "ts_mean_rolling.png", dpi=160)
+plt.show()
+
+# ---------------- Tendência: Mann–Kendall sazonal + Theil–Sen + OLS ----------------
+# MK sazonal (período 12 meses)
+try:
+    mk_res = mk.seasonal_test(ts.values, period=12)
+except Exception:
+    mk_res = mk.original_test(ts.values)
+
+# Theil–Sen (robusto) sobre a série interpolada
+# Usaremos tempo em anos fracionários para slope em µg/L por ano
+t_years = (ts_interp.index.year + (ts_interp.index.dayofyear - 1)/365.25).astype(float)
+X = t_years
+Y = ts_interp.values
+# Theil–Sen manual simples
+from scipy.stats import theilslopes
+theta = theilslopes(Y, X, 0.95)
+sen_slope = theta[0]    # µg/L por ano
+sen_inter = theta[1]
+
+# OLS (tendência linear simples, com erro padrão HAC Newey-West opcional)
+X_ols = sm.add_constant(X)
+ols = sm.OLS(Y, X_ols).fit(cov_type="HAC", cov_kwds={"maxlags":12})
+ols_slope = ols.params[1]
+ols_p     = ols.pvalues[1]
+
+print("\n===== Trend Summary =====")
+print(f"Mann–Kendall seasonal: trend={mk_res.trend}, p={mk_res.p:.4f}, tau={mk_res.Tau:.3f}")
+print(f"Theil–Sen slope: {sen_slope:.3f} µg/L/yr (95% CI approx. via theilslopes)")
+print(f"OLS slope: {ols_slope:.3f} µg/L/yr (p={ols_p:.4f})")
+
+# Adiciona linha de tendência (OLS) ao gráfico
+plt.figure(figsize=(11,4.5))
+plt.plot(ts.index, ts.values, lw=1.2, label="Monthly spatial mean")
+y_fit = ols.params[0] + ols.params[1] * X
+plt.plot(ts.index, y_fit, lw=2.0, label=f"OLS trend ({ols_slope:.2f} µg/L/yr, p={ols_p:.3f})")
+plt.xlabel("Date"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Trend analysis — OLS trend line")
+plt.grid(alpha=0.25)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUT_DIR / "ts_trend_ols.png", dpi=160)
+plt.show()
+
+# ---------------- Decomposição STL ----------------
+# Usa a série interpolada (regular) e período 12
+stl = STL(ts_interp, period=12, robust=True).fit()
+plt.figure(figsize=(11,7))
+ax = plt.subplot(4,1,1); ax.plot(stl.observed); ax.set_title("Observed"); ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,2); ax.plot(stl.trend);    ax.set_title("Trend");    ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,3); ax.plot(stl.seasonal); ax.set_title("Seasonal"); ax.grid(alpha=0.2)
+ax = plt.subplot(4,1,4); ax.plot(stl.resid);    ax.set_title("Residual"); ax.grid(alpha=0.2)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "stl_decomposition.png", dpi=160)
+plt.show()
+
+# ---------------- Boxplot por mês-do-ano (climatologia da média espacial) ----------------
+# Distribuição das médias mensais agrupadas por mês do ano
+df_m = df.copy()
+df_m["mon"] = df_m["date"].dt.month
+order = range(1,13)
+
+# Para desenhar boxplots com matplotlib puro
+plt.figure(figsize=(12,5))
+data_by_month = [df_m.loc[df_m["mon"]==m, "mean"].values for m in order]
+plt.boxplot(data_by_month, labels=[datetime(2001, m, 1).strftime("%b") for m in order], showfliers=False)
+plt.xlabel("Month"); plt.ylabel("Chl-a (µg/L)")
+plt.title("Monthly distribution of spatial means (climatological boxplot)")
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "boxplot_monthly_means_by_month.png", dpi=160)
+plt.show()
+
+# ---------------- (Opcional) Boxplot anual das médias espaciais (distribuição por ano) ----------------
+if DO_YEARLY_SPATIAL_BOXPLOTS:
+    df_y = df.copy()
+    years_sorted = sorted(df_y["year"].unique().tolist())
+    plt.figure(figsize=(12,5))
+    data_by_year = [df_y.loc[df_y["year"]==yy, "mean"].values for yy in years_sorted]
+    plt.boxplot(data_by_year, labels=[str(y) for y in years_sorted], showfliers=False)
+    plt.xlabel("Year"); plt.ylabel("Chl-a (µg/L)")
+    plt.title("Yearly distribution of spatial means (boxplot)")
+    plt.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "boxplot_yearly_means.png", dpi=160)
+    plt.show()
+
+# ---------------- Anomalias e heatmap ano×mês ----------------
+# Anomalia por mês do ano (remove climatologia mensal da série das médias)
+clim = df.groupby("month")["mean"].mean()
+df["anomaly"] = df.apply(lambda r: r["mean"] - clim.loc[r["month"]], axis=1)
+# Matriz ano×mês
+mat = df.pivot(index="year", columns="month", values="anomaly").sort_index()
+years = mat.index.values
+months = mat.columns.values
+
+plt.figure(figsize=(12,5))
+im = plt.imshow(mat.values, aspect="auto", cmap="RdBu_r", vmin=-np.nanmax(abs(mat.values)), vmax=np.nanmax(abs(mat.values)))
+plt.colorbar(im, label="Anomaly (µg/L)")
+plt.yticks(ticks=np.arange(len(years)), labels=years)
+plt.xticks(ticks=np.arange(len(months)), labels=[datetime(2001, m, 1).strftime("%b") for m in months], rotation=0)
+plt.title("Monthly anomalies of spatial mean (year × month)")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "heatmap_anomalies_year_month.png", dpi=160)
+plt.show()
+
+# ---------------- Autocorrelação (ACF) da série ----------------
+from statsmodels.graphics.tsaplots import plot_acf
+fig = plt.figure(figsize=(8,4))
+plot_acf(ts_interp.dropna(), lags=36, ax=plt.gca())
+plt.title("Autocorrelation of monthly spatial mean (ACF)")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "acf_monthly_mean.png", dpi=160)
+plt.show()
+
+# ---------------- Histograma (distribuição das médias mensais) ----------------
+plt.figure(figsize=(8,4))
+plt.hist(df["mean"].values, bins=25, edgecolor="k", alpha=0.7)
+plt.xlabel("Chl-a (µg/L) — monthly spatial mean"); plt.ylabel("Frequency")
+plt.title("Distribution of monthly spatial means")
+plt.grid(axis="y", alpha=0.25)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "hist_monthly_means.png", dpi=160)
+plt.show()
+
+print(f"\n[OK] Figuras salvas em: {OUT_DIR}")
+print("Arquivos gerados:")
+for p in sorted(OUT_DIR.glob("*.png")):
+    print(" -", p)
+print(" -", CSV_OUT)
