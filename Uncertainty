@@ -1,0 +1,233 @@
+# ============================================================
+# Mapas de incerteza por pixel a partir das predições mensais
+# - STD (variabilidade), MAD (robusta)
+# - Bootstrap SE (erro-padrão do mean) e PI95 (largura)
+# - MAA (Mean Absolute Anomaly) vs climatologia mensal
+# - Processamento em janelas (eficiente em memória)
+# ============================================================
+
+import os, glob, math, warnings
+from pathlib import Path
+import numpy as np
+import rasterio as rio
+from rasterio.windows import Window
+from rasterio.plot import plotting_extent
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+# ---------------- Config ----------------
+PRED_DIR = "/content/artifacts_curuai_modis_only/pred"  # AJUSTE aqui se necessário
+PATTERN  = "curuai_chla_*.tif"
+OUT_DIR  = Path("/content/uncertainty_maps"); OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Bootstrap
+B_BOOT   = 200            # nº de reamostragens bootstrap (aumente para 500/1000 se quiser mais precisão)
+RNG_SEED = 42
+rng      = np.random.default_rng(RNG_SEED)
+
+# Janelas (processamento em blocos)
+WIN_SIZE = 512            # pixels por lado (ajuste para caber em RAM; 512/1024 ok)
+DEFAULT_NODATA = -9999.0
+
+# Saídas
+STD_TIF  = OUT_DIR / "unc_std.tif"
+MAD_TIF  = OUT_DIR / "unc_mad_scaled.tif"
+SE_TIF   = OUT_DIR / "unc_boot_se_mean.tif"
+PIW_TIF  = OUT_DIR / "unc_boot_pi95_width.tif"
+MAA_TIF  = OUT_DIR / "unc_mean_abs_anomaly.tif"  # relativo à climatologia mensal local
+
+# ---------------- Utilitários ----------------
+def list_pred_files(pred_dir=PRED_DIR, pattern=PATTERN):
+    files = sorted(glob.glob(str(Path(pred_dir) / pattern)))
+    if not files:
+        raise RuntimeError(f"Nenhum GeoTIFF encontrado em {pred_dir} com padrão {pattern}")
+    return files
+
+def open_reference(files):
+    with rio.open(files[0]) as ref:
+        profile = ref.profile.copy()
+        height, width = ref.height, ref.width
+        nodata = ref.nodata if ref.nodata is not None else DEFAULT_NODATA
+        transform = ref.transform
+        crs = ref.crs
+    return profile, height, width, nodata, transform, crs
+
+def iter_windows(width, height, win=WIN_SIZE):
+    for row in range(0, height, win):
+        h = min(win, height - row)
+        for col in range(0, width, win):
+            w = min(win, width - col)
+            yield Window(col_off=col, row_off=row, width=w, height=h)
+
+def read_stack_window(files, window, nodata):
+    """
+    Lê uma janela (window) de todos os arquivos e retorna um array (T, H, W)
+    com NaN para nodata.
+    """
+    arrs = []
+    for fp in files:
+        with rio.open(fp) as ds:
+            a = ds.read(1, window=window).astype(np.float32)
+            nd = ds.nodata if ds.nodata is not None else nodata
+            a = np.where((a == nd) | ~np.isfinite(a), np.nan, a)
+            arrs.append(a)
+    stack = np.stack(arrs, axis=0)  # (T, H, W)
+    return stack
+
+def mad_scaled(x, axis=0):
+    """
+    Median Absolute Deviation escalado (x1.4826) ≈ σ sob normalidade.
+    Ignora NaN.
+    """
+    med = np.nanmedian(x, axis=axis)
+    mad = np.nanmedian(np.abs(x - np.expand_dims(med, axis=axis)), axis=axis)
+    return 1.4826 * mad
+
+def bootstrap_stats(x, B=B_BOOT, rng=rng):
+    """
+    Bootstrap temporal por pixel:
+    - x: série (T,) com NaNs
+    Retorna:
+      se_mean: erro-padrão do mean via bootstrap
+      piw95: largura do intervalo de predição 95% (p97.5 - p2.5) das amostras bootstrap
+    Observação: reamostra índices válidos (sem NaN).
+    """
+    x_valid = x[np.isfinite(x)]
+    n = x_valid.size
+    if n < 3:
+        return np.nan, np.nan
+    # Amostragens bootstrap com reposição
+    samples_idx = rng.integers(0, n, size=(B, n), endpoint=False)
+    bs = x_valid[samples_idx]                      # (B, n)
+    means = np.nanmean(bs, axis=1)                # (B,)
+    # Erro-padrão do mean via bootstrap
+    se_mean = np.nanstd(means, ddof=1)
+    # Intervalo 95% (largura)
+    q2, q97 = np.nanpercentile(means, [2.5, 97.5])
+    piw95 = q97 - q2
+    return float(se_mean), float(piw95)
+
+def monthly_index_from_filename(fp):
+    """
+    Extrai mês (1-12) do nome 'curuai_chla_YYYY-MM.tif'
+    """
+    name = Path(fp).name
+    m = None
+    import re
+    r = re.search(r"(\d{4})-(\d{2})", name)
+    if r:
+        m = int(r.group(2))
+    return m
+
+# ---------------- Fluxo ----------------
+files = list_pred_files(PRED_DIR, PATTERN)
+profile, H, W, nodata, transform, crs = open_reference(files)
+print(f"[INFO] {len(files)} imagens | {W}x{H} | CRS={crs} | nodata={nodata}")
+
+# Pré-calcular meses para climatologia mensal
+months_list = [monthly_index_from_filename(fp) for fp in files]
+
+# Preparar rasters de saída
+prof_out = profile.copy()
+prof_out.update(dtype="float32", count=1, nodata=DEFAULT_NODATA, compress="deflate")
+
+dst_std = rio.open(STD_TIF, "w", **prof_out)
+dst_mad = rio.open(MAD_TIF, "w", **prof_out)
+dst_se  = rio.open(SE_TIF,  "w", **prof_out)
+dst_piw = rio.open(PIW_TIF, "w", **prof_out)
+dst_maa = rio.open(MAA_TIF, "w", **prof_out)
+
+try:
+    # Percorre por janelas
+    for win in iter_windows(W, H, WIN_SIZE):
+        stack = read_stack_window(files, win, nodata)  # (T, h, w)
+        T, h, w = stack.shape
+
+        # STD temporal
+        std_win = np.nanstd(stack, axis=0, ddof=1)  # (h, w)
+
+        # MAD escalado
+        mad_win = mad_scaled(stack, axis=0)         # (h, w)
+
+        # Climatologia mensal local: média por mês (1..12) no pixel
+        # Construir mapa de anomalia absoluta média (MAA)
+        maa_win = np.full((h, w), np.nan, dtype=np.float32)
+        # Para eficiência, vamos calcular climatologia mês a mês com máscaras
+        clim_means = {}
+        for mo in range(1, 13):
+            mask_t = np.array([m == mo for m in months_list], dtype=bool)
+            if mask_t.any():
+                clim_means[mo] = np.nanmean(stack[mask_t, :, :], axis=0)  # (h, w)
+        # Anomalias mês a mês e média do valor absoluto:
+        #   mean( |x_t - clim[mês_t]| ) ao longo do tempo
+        abs_anoms_acc = np.zeros((h, w), dtype=np.float64)
+        count_valid   = np.zeros((h, w), dtype=np.int32)
+        for t in range(T):
+            mo = months_list[t]
+            if mo in clim_means:
+                clim = clim_means[mo]
+                x    = stack[t, :, :]
+                diff = np.abs(x - clim)
+                mval = np.isfinite(diff)
+                abs_anoms_acc[mval] += diff[mval]
+                count_valid[mval]   += 1
+        maa_win = np.where(count_valid > 0, abs_anoms_acc / np.maximum(count_valid, 1), np.nan)
+
+        # Bootstrap por pixel (mean) — calcula SE e PI95-width
+        se_win  = np.full((h, w), np.nan, dtype=np.float32)
+        piw_win = np.full((h, w), np.nan, dtype=np.float32)
+
+        # Vamos iterar por colunas/linhas da janela — custo computacional moderado
+        for i in range(h):
+            # vetor (T, w) → processar coluna a coluna p/ reduzir overhead python
+            series_block = stack[:, i, :]  # (T, w)
+            for j in range(w):
+                x = series_block[:, j]
+                if np.isfinite(x).sum() >= 3:
+                    se, piw = bootstrap_stats(x, B=B_BOOT, rng=rng)
+                    se_win[i, j]  = se
+                    piw_win[i, j] = piw
+
+        # Escrever janela em disco (posicionada por window=win)
+        dst_std.write(std_win.astype(np.float32), 1, window=win)
+        dst_mad.write(mad_win.astype(np.float32), 1, window=win)
+        dst_se.write(se_win.astype(np.float32),   1, window=win)
+        dst_piw.write(piw_win.astype(np.float32), 1, window=win)
+        dst_maa.write(maa_win.astype(np.float32), 1, window=win)
+
+        # Log
+        print(f"[INFO] janela escrita: row={win.row_off}:{win.row_off+win.height} col={win.col_off}:{win.col_off+win.width}")
+
+finally:
+    dst_std.close()
+    dst_mad.close()
+    dst_se.close()
+    dst_piw.close()
+    dst_maa.close()
+
+print("\n[OK] Mapas salvos em:")
+print(" -", STD_TIF,  "   (STD temporal)")
+print(" -", MAD_TIF,  "   (MAD escalado ≈ σ robusto)")
+print(" -", SE_TIF,   "   (Bootstrap SE do mean)")
+print(" -", PIW_TIF,  "   (Bootstrap PI95 width do mean)")
+print(" -", MAA_TIF,  "   (Mean Absolute Anomaly vs climatologia mensal)")
+
+# ---------------- Previews rápidos ----------------
+def preview(tif_path, title, cmap="viridis"):
+    with rio.open(tif_path) as ds:
+        arr = ds.read(1, masked=True)
+        ext = plotting_extent(ds)
+    v = arr.compressed()
+    vmin, vmax = (np.percentile(v, (2,98)) if v.size else (0,1))
+    plt.figure(figsize=(8,6))
+    plt.imshow(arr, extent=ext, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    plt.title(title); plt.xticks([]); plt.yticks([])
+    cbar = plt.colorbar(); cbar.set_label("µg/L")
+    plt.tight_layout(); plt.show()
+
+preview(STD_TIF, "STD (temporal variability)")
+preview(MAD_TIF, "MAD scaled (robust sigma)")
+preview(SE_TIF,  "Bootstrap SE (mean)")
+preview(PIW_TIF, "Bootstrap PI95 width (mean)")
+preview(MAA_TIF, "Mean Absolute Anomaly vs monthly climatology")
