@@ -1,8 +1,11 @@
 # ==============================================
-# Estações do ano — plot 2×2 (versão alinhada)
+# Estações do ano — plot 2×2 (CLIMATOLOGIA por MÉDIA, viridis, realce perceptual)
+# - usa TODA a série temporal (média por mês)
+# - viridis com PowerNorm(gamma=0.5) p/ realçar gradientes em baixos valores
 # - extent com plotting_extent (sem origin="upper")
 # - máscara da ROI por rasterização (grid-alinhado)
 # - contorno usa as mesmas geometrias da máscara
+# - saída em 500 dpi
 # ==============================================
 
 import os, re, glob, warnings
@@ -13,6 +16,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FormatStrFormatter
+from matplotlib.colors import PowerNorm
 import fiona
 
 # garante restauração de .shx ausente quando possível
@@ -44,7 +48,7 @@ for pkg, imp in [
 # ================= Config =================
 PRED_DIR = "/content/artifacts_curuai_modis_only/pred"
 OUT_DIR  = Path("/content/artifacts_curuai_modis_only/plots"); OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_FIG  = OUT_DIR / "chla_seasons.png"
+OUT_FIG  = OUT_DIR / "chla_seasons_mean.png"
 
 # Defina o shapefile (ou .zip/.gpkg/.geojson)
 SHP_PATH = "/content/Curuai.shp"
@@ -53,17 +57,29 @@ SHP_PATH = "/content/Curuai.shp"
 ROI_CRS_OVERRIDE = None         # ex.: "EPSG:4326" ou "EPSG:4674"
 ALL_TOUCHED = True              # rasterização encostando nos limites
 
-FORCE_MASK = True               # aplica máscara pela ROI
+FORCE_MASK   = True             # aplica máscara pela ROI
 DRAW_OUTLINE = True             # desenha contorno da ROI
-YEAR = None                     # None = escolhe ano mais recente com todos os meses; ou defina ex.: 2016
 
-# Datas sazonais pedidas (Hemisfério Sul)
+# >>> Usar TODA a série temporal (climatologia) para cada mês das estações
+USE_CLIMATOLOGY = True          # True = empilha todos os anos; False = tenta “melhor ano”
+YEAR = None                     # ignorado se USE_CLIMATOLOGY=True
+
+# Datas sazonais (Hemisfério Sul)
 SEASONS = [
     ("(a) Outono — 20 mar", 3),
     ("(b) Inverno — 20 jun", 6),
     ("(c) Primavera — 22 set", 9),
     ("(d) Verão — 21 dez", 12),
 ]
+
+# Percentis p/ vmin/vmax (ajuste se quiser mais contraste sem distorcer demais)
+PCTL_LOW, PCTL_HIGH = 2, 98
+
+# Realce perceptual mantendo viridis
+POW_GAMMA = 0.5                 # <1 realça baixas concentrações; >1 realça altas
+
+# DPI da figura final
+DPI_OUT = 500
 
 warnings.filterwarnings("ignore", message="CPLE_AppDefined")
 warnings.filterwarnings("ignore", category=UserWarning, module="rasterio")
@@ -98,13 +114,13 @@ def list_monthly_files(pred_dir):
         recs.append((y, mo, f))
     return recs
 
-# >>> usar plotting_extent (em vez de bounds bruto) para o imshow
+# usar plotting_extent (em vez de bounds bruto) para o imshow
 from rasterio.plot import plotting_extent
 
 def open_raster(path):
     with rio.open(path) as ds:
         arr = ds.read(1, masked=True)
-        extent = plotting_extent(ds)   # (xmin, xmax, ymin, ymax) coerente com a affine (dy<0 etc.)
+        extent = plotting_extent(ds)   # (xmin, xmax, ymin, ymax) coerente com a affine
         transform = ds.transform
         crs = ds.crs
     return arr, extent, transform, crs
@@ -154,7 +170,7 @@ def pick_best_year(records, months_needed):
             return y
     return None
 
-def climatology_month(records, month):
+def climatology_month(records, month, reducer="mean"):
     stacks = []
     ref_shape = ref_extent = ref_transform = ref_crs = None
     for y, m, f in records:
@@ -165,13 +181,17 @@ def climatology_month(records, month):
             ref_shape, ref_extent, ref_transform, ref_crs = arr.shape, extent, transform, crs
             stacks.append(arr)
         else:
+            # só empilha se shape e extent baterem (evita mosaicos com grade diferente)
             if arr.shape == ref_shape and extent == ref_extent:
                 stacks.append(arr)
     if len(stacks) == 0:
         return None, None, None, None, "sem dados"
     data = np.ma.array(stacks)
-    med = np.ma.median(data, axis=0)
-    return med, ref_extent, ref_transform, ref_crs, "climatologia"
+    if reducer == "median":
+        red = np.ma.median(data, axis=0)
+    else:
+        red = np.ma.mean(data, axis=0)
+    return red, ref_extent, ref_transform, ref_crs, "climatologia"
 
 # ================= Carrega e organiza =================
 records = list_monthly_files(PRED_DIR)
@@ -184,32 +204,20 @@ for y, m, f in records[:5]:
 if len(records) > 5:
     print(f"  ... e mais {len(records)-5} arquivos")
 
+years_all = sorted({y for y,_,_ in records})
+years_span = f"{years_all[0]}–{years_all[-1]}" if years_all else "—"
+
 months_needed = [m for _, m in SEASONS]
 arrs, extents, transforms, crss, tags = [], [], [], [], []
 
-if YEAR is None:
-    y_best = pick_best_year(records, months_needed)
-    if y_best is not None:
-        print(f"[INFO] Usando ano {y_best} (contém todos os meses necessários)")
-        for label, mo in SEASONS:
-            path = [f for y,m,f in records if y==y_best and m==mo][0]
-            arr, extent, transform, crs = open_raster(path)
-            arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(f"{y_best:04d}-{mo:02d}")
-    else:
-        print("[INFO] Nenhum ano único contém todos os meses. Usando climatologia.")
-        for label, mo in SEASONS:
-            arr, extent, transform, crs, tag = climatology_month(records, mo)
-            if arr is None:
-                raise RuntimeError(f"Sem dados para o mês {mo:02d} em nenhum ano para montar a climatologia.")
-            arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(tag)
-else:
-    print(f"[INFO] Usando ano específico: {YEAR}")
-    for label, mo in SEASONS:
-        match = [f for y,m,f in records if y==YEAR and m==mo]
-        if not match:
-            raise RuntimeError(f"Arquivo para {YEAR}-{mo:02d} não encontrado em {PRED_DIR}.")
-        arr, extent, transform, crs = open_raster(match[0])
-        arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs); tags.append(f"{YEAR:04d}-{mo:02d}")
+# Força CLIMATOLOGIA por MÉDIA
+print("[INFO] Modo climatologia (MÉDIA) — empilhando todos os anos para cada mês solicitado")
+for label, mo in SEASONS:
+    arr, extent, transform, crs, _tag = climatology_month(records, mo, reducer="mean")
+    if arr is None:
+        raise RuntimeError(f"Sem dados para o mês {mo:02d} em nenhum ano para montar a climatologia.")
+    arrs.append(arr); extents.append(extent); transforms.append(transform); crss.append(crs)
+    tags.append(f"climatologia (média {years_span})")
 
 # ================= Aplicar máscara (rasterização alinhada ao grid) =================
 masked_arrs = []
@@ -227,7 +235,7 @@ if FORCE_MASK:
 else:
     masked_arrs = arrs
 
-# ================= Escala de cores (robusta 2–98%) =================
+# ================= Escala de cores (robusta PCTL_LOW–PCTL_HIGH) =================
 all_vals = []
 for a in masked_arrs:
     vals_i = a.compressed() if hasattr(a, 'compressed') else a[~np.isnan(a)]
@@ -245,7 +253,7 @@ if len(all_vals) == 0:
         raise RuntimeError("Sem valores válidos nos rasters (mesmo sem máscara).")
 
 vals = np.concatenate(all_vals)
-vmin, vmax = np.percentile(vals, (2, 98))
+vmin, vmax = np.percentile(vals, (PCTL_LOW, PCTL_HIGH))
 if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
     vmax = float(np.nanmax(vals)); vmin = max(0.0, float(np.nanmin(vals)))
     if not np.isfinite(vmax) or vmax == vmin:
@@ -269,8 +277,9 @@ if DRAW_OUTLINE and geoms_tx_plot is not None:
         roi_outline = None
 
 for ax, (label, _mo), arr, extent, tr, crs, tag in zip(axes.flat, SEASONS, masked_arrs, extents, transforms, crss, tags):
-    # >>> sem origin="upper"; extent já reflete a affine
-    im = ax.imshow(arr, extent=extent, vmin=vmin, vmax=vmax, cmap="viridis", interpolation="nearest")
+    # viridis + PowerNorm para realçar gradientes mantendo viridis
+    norm = PowerNorm(gamma=POW_GAMMA, vmin=vmin, vmax=vmax)
+    im = ax.imshow(arr, extent=extent, cmap="viridis", norm=norm, interpolation="nearest")
     ax.set_title(f"{label} — {tag}", fontsize=11)
     ax.set_xticks([]); ax.set_yticks([])
     ax.set_aspect("equal")
@@ -286,9 +295,12 @@ cbar = fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.85, pad=0.02, ticks=c
 cbar.ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
 cbar.set_label("Clorofila-a (mg/m³)")
 
-fig.suptitle("Lago Curuai - Clorofila-a (MODIS)\nMosaicos mensais nos equinócios/solstícios do Hemisfério Sul", fontsize=13)
+fig.suptitle(
+    "Lago Curuai - Clorofila-a (MODIS)\nClimatologia (média) nos equinócios/solstícios do Hemisfério Sul",
+    fontsize=13
+)
 
-plt.savefig(OUT_FIG, dpi=220)
+plt.savefig(OUT_FIG, dpi=DPI_OUT)
 plt.close(fig)
 
-print(f"Figura salva em: {OUT_FIG}")
+print(f"Figura salva em: {OUT_FIG} (DPI={DPI_OUT})")
