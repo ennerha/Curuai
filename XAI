@@ -314,3 +314,77 @@ if EXPLAIN_TIF and Path(TIF_FEATURES).exists():
 print("\n[OK] XAI concluído. Artefatos em:", OUT_XAI)
 for p in sorted(OUT_XAI.glob("*")):
     print(" -", p)
+# ==============================
+# XAI - Beeswarm + Painel Dependence
+# ==============================
+import os
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import shap
+
+# Diretório de saída
+OUT_DIR = "/content/xai_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ========================
+# 1) Beeswarm plot (top-12)
+# ========================
+TOP_K_PLOTS = min(12, len(FEATURES))
+
+plt.figure(figsize=(9, 7))
+shap.summary_plot(
+    shap_values, X_exp,
+    feature_names=FEATURES,
+    max_display=TOP_K_PLOTS,
+    show=False
+)
+plt.tight_layout()
+plt.savefig(f"{OUT_DIR}/shap_beeswarm.png", dpi=500, bbox_inches="tight")
+plt.close()
+
+# ==============================
+# 2) Painel de dependence plots
+# ==============================
+# Seleciona top-6 features pelo |shap|
+abs_means = np.mean(np.abs(shap_values), axis=0)
+top_idx = list(np.argsort(abs_means)[::-1])[:min(6, len(FEATURES))]
+
+n = len(top_idx)
+cols = 3
+rows = math.ceil(n / cols)
+
+fig, axes = plt.subplots(rows, cols, figsize=(5.0*cols, 4.0*rows), constrained_layout=True)
+axes = np.array(axes).ravel() if isinstance(axes, np.ndarray) else [axes]
+
+for k, i in enumerate(top_idx):
+    # usa a segunda feature mais importante para colorir, se existir
+    if len(top_idx) > 1:
+        j = top_idx[0] if top_idx[0] != i else top_idx[1]
+    else:
+        j = "auto"
+    shap.dependence_plot(
+        ind=i,
+        shap_values=shap_values,
+        features=X_exp,
+        feature_names=FEATURES,
+        interaction_index=j,
+        ax=axes[k],
+        show=False
+    )
+    axes[k].set_title(f"({chr(97+k)}) {FEATURES[i]}", loc="left")
+
+# remove eixos sobrando
+for k in range(n, rows*cols):
+    fig.delaxes(axes[k])
+
+# estética geral
+for ax in fig.axes:
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+fig.suptitle("SHAP dependence plots", fontsize=13)
+fig.savefig(f"{OUT_DIR}/shap_dependence_panel.png", dpi=500, bbox_inches="tight")
+plt.close(fig)
+
+print("Figuras salvas em:", OUT_DIR)
