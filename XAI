@@ -1,0 +1,316 @@
+# ============================================================
+# XAI para SVR_Optuna (Global) — Curuai
+# - Carrega modelo: /content/artifacts_curuai/curuai_svr_global.pkl
+# - Reconstroi features do treinamento (rrs.xlsx + stations.xlsx)
+# - SHAP (KernelExplainer): global & local + dependências
+# - PDP & ICE para top features
+# - Surrogate Tree (interpretable model)
+# - (Opcional) XAI em GeoTIFF de features exportado (amostra de pixels)
+# ============================================================
+
+# !pip -q install shap scikit-learn matplotlib pandas numpy rasterio joblib openpyxl
+
+import os, re, json, warnings, joblib, random
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # Colab/servidor: salvar figuras
+import matplotlib.pyplot as plt
+
+from sklearn.inspection import PartialDependenceDisplay
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.metrics import r2_score
+from sklearn.utils import check_random_state
+
+import shap
+import rasterio as rio
+
+warnings.filterwarnings("ignore")
+np.set_printoptions(suppress=True)
+
+# ------------------------- Config -------------------------
+ART_TRAIN   = Path("/content/artifacts_curuai")
+P_MODEL     = ART_TRAIN / "curuai_svr_global.pkl"   # <<< melhor modelo
+RRSPATH     = "/content/rrs.xlsx"
+STPATH      = "/content/stations.xlsx"
+FLAGSPATH   = "/content/flags.csv"                  # opcional (usado no treino)
+OUT_XAI     = Path("/content/xai_outputs"); OUT_XAI.mkdir(parents=True, exist_ok=True)
+
+RANDOM_STATE = 42
+BGN_SAMPLES  = 200     # amostras de fundo p/ SHAP Kernel (trade-off custo/tempo)
+EXPL_SAMPLES = 600     # amostras a explicar (beeswarm etc.)
+TOP_K_PLOTS  = 12      # nº de features em gráficos globais
+N_GRID_PDP   = 30      # pontos na grade PDP/ICE
+
+# (Opcional) explicar um GeoTIFF de features (exportado do GEE)
+# Habilite e ajuste se quiser:
+EXPLAIN_TIF  = False
+TIF_FEATURES = "/content/artifacts_curuai_modis_only/features/curuai_feats_2016-09.tif"
+PIX_SAMPLES  = 2000    # nº de pixels amostrados para XAI no TIF
+
+# ------------------ Helpers (iguais ao treinamento) ------------------
+def normalize_strong(s: str) -> str:
+    s = str(s or "").lower()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = s.replace(" ", "")
+    return s
+
+def safe_ratio(a, b):
+    a = a.astype(float); b = b.astype(float)
+    den = a + b; den[den == 0] = np.nan
+    return (a - b) / den
+
+def first_derivative(df_bands):
+    cols = sorted(df_bands.columns, key=lambda c: int(c.split("_")[1]))
+    arr = df_bands[cols].values
+    d1 = np.diff(arr, axis=1)
+    return {"d1_mean": np.nanmean(d1, axis=1), "d1_p95": np.nanpercentile(d1, 95, axis=1)}
+
+def second_derivative(df_bands):
+    cols = sorted(df_bands.columns, key=lambda c: int(c.split("_")[1]))
+    arr = df_bands[cols].values
+    d2 = np.diff(arr, n=2, axis=1)
+    return {"d2_mean": np.nanmean(d2, axis=1), "d2_p95": np.nanpercentile(d2, 95, axis=1)}
+
+def window_sum(df_bands, lmin, lmax, band_core):
+    cols = [c for c in df_bands.columns if c.startswith("Rrs_") and c in band_core and lmin <= int(c.split("_")[1]) <= lmax]
+    if len(cols) == 0: return np.full(len(df_bands), np.nan)
+    return df_bands[cols].sum(axis=1)
+
+def build_training_features(rrs_path=RRSPATH, st_path=STPATH, flags_path=FLAGSPATH):
+    assert Path(rrs_path).exists() and Path(st_path).exists(), "Suba rrs.xlsx e stations.xlsx."
+    rrs = pd.read_excel(rrs_path)
+    sta = pd.read_excel(st_path, sheet_name="Data")
+
+    band_cols_all = [c for c in rrs.columns if c.startswith("Rrs_")]
+    wanted = [443,490,510,560,620,665,681,700,705,708,709]
+    band_core = [f"Rrs_{b}" for b in wanted if f"Rrs_{b}" in band_cols_all]
+    if not band_core: band_core = band_cols_all
+
+    sta_cols = [c for c in ["BR_ID","lake_name","chla_ugL","date"] if c in sta.columns]
+    df = rrs[["BR_ID"] + band_core].merge(sta[sta_cols], on="BR_ID", how="inner")
+
+    # Apenas Curuai
+    norm_name = df["lake_name"].map(normalize_strong)
+    mask_curuai = norm_name.str.contains("curuai", regex=False)
+    df = df.loc[mask_curuai].copy()
+    df = df.dropna(subset=["chla_ugL"]).copy()
+
+    # QA por flags (se existir)
+    if flags_path and Path(flags_path).exists():
+        flags = pd.read_csv(flags_path) if str(flags_path).lower().endswith(".csv") else pd.read_excel(flags_path)
+        if "BR_ID" in flags.columns:
+            dff = df.merge(flags, on="BR_ID", how="left", suffixes=("","_flag"))
+            # QWIP ±0.2
+            qwi_cols = [c for c in dff.columns if 'qwi' in c.lower()]
+            mask_qwi_bad = False
+            for c in qwi_cols:
+                x = pd.to_numeric(dff[c], errors="coerce")
+                if x.notna().any():
+                    bad = (x < -0.2) | (x > 0.2)
+                    mask_qwi_bad = bad if isinstance(mask_qwi_bad, bool) else (mask_qwi_bad | bad)
+            # outras flags
+            pat_bad = re.compile(r'(negative|susp|baseline|oxygen|noisy)', re.I)
+            bad_cols = [c for c in dff.columns if pat_bad.search(c)]
+            mask_misc_bad = False
+            for c in bad_cols:
+                v = dff[c]
+                if v.dtype == bool:
+                    bad = v
+                else:
+                    bad = pd.to_numeric(v, errors="coerce").fillna(0) > 0
+                mask_misc_bad = bad if isinstance(mask_misc_bad, bool) else (mask_misc_bad | bad)
+            drop_mask = (mask_qwi_bad if not isinstance(mask_qwi_bad, bool) else False) | \
+                        (mask_misc_bad if not isinstance(mask_misc_bad, bool) else False)
+            df = dff.loc[~drop_mask, df.columns].copy()
+
+    # exigir >= 6 bandas; imputar mediana
+    min_bands_required = min(6, len(band_core))
+    valid = df[band_core].notna().sum(axis=1) >= min_bands_required
+    df = df.loc[valid].copy()
+    for b in band_core:
+        df[b] = df[b].fillna(df[b].median())
+
+    # Engenharia espectral (igual ao treino)
+    B = df[band_core].copy()
+    F = B.copy()
+    if "Rrs_560" in B.columns:
+        for c in B.columns: F[c+"_norm560"] = B[c] / (B["Rrs_560"] + 1e-12)
+    F["norm_Rrs_L1"] = B.sum(axis=1) + 1e-12
+    for c in B.columns: F[c+"_normL1"] = B[c] / F["norm_Rrs_L1"]
+
+    if {"Rrs_708","Rrs_665"}.issubset(B.columns): F["NDCI"] = safe_ratio(B["Rrs_708"], B["Rrs_665"])
+    if {"Rrs_681","Rrs_665"}.issubset(B.columns): F["Red_a"] = safe_ratio(B["Rrs_681"], B["Rrs_665"])
+    if {"Rrs_560","Rrs_490"}.issubset(B.columns): F["G_over_B"] = B["Rrs_560"] / (B["Rrs_490"] + 1e-12)
+    if {"Rrs_490","Rrs_665"}.issubset(B.columns): F["B_over_R"] = B["Rrs_490"] / (B["Rrs_665"] + 1e-12)
+    if {"Rrs_709","Rrs_681"}.issubset(B.columns): F["RedEdgeSlope"] = B["Rrs_709"] - B["Rrs_681"]
+    if {"Rrs_700","Rrs_665"}.issubset(B.columns): F["RedPeakMinusR"] = B["Rrs_700"] - B["Rrs_665"]
+    if {"Rrs_705","Rrs_681"}.issubset(B.columns): F["Slope_681_705"] = B["Rrs_705"] - B["Rrs_681"]
+
+    F["Area_Blue"]  = window_sum(B, 440, 500, band_core)
+    F["Area_Green"] = window_sum(B, 520, 580, band_core)
+    F["Area_Red"]   = window_sum(B, 650, 700, band_core)
+    F["Area_RE"]    = window_sum(B, 700, 710, band_core)
+
+    d1 = first_derivative(B); d2 = second_derivative(B)
+    for k,v in d1.items(): F[k] = v
+    for k,v in d2.items(): F[k] = v
+
+    F = F.replace([np.inf,-np.inf], np.nan)
+    for c in F.columns: F[c] = F[c].fillna(F[c].median())
+
+    y = np.log1p(df["chla_ugL"].astype(float)).values
+    meta = df[["BR_ID","date"]].copy() if "BR_ID" in df.columns else pd.DataFrame(index=df.index)
+    return F, y, meta
+
+# -------------------- Carrega modelo + features --------------------
+M = joblib.load(P_MODEL)
+svr_pipe = M["model"]
+FEATURES = M["features"]
+print(f"[MODEL] Carregado: {P_MODEL}")
+print(f"[MODEL] #features = {len(FEATURES)}")
+
+# Reconstroi matriz X do treino (mesmas features)
+F_all, y_log, meta = build_training_features(RRSPATH, STPATH, FLAGSPATH)
+F_all = F_all.fillna(F_all.median())  # segurança
+missing = [f for f in FEATURES if f not in F_all.columns]
+if missing:
+    raise RuntimeError(f"As seguintes features do modelo não foram geradas: {missing}")
+X_all = F_all[FEATURES].values
+
+# -------------------- Amostras para SHAP --------------------
+rng = check_random_state(RANDOM_STATE)
+idx_all = np.arange(X_all.shape[0])
+rng.shuffle(idx_all)
+
+bg_idx   = idx_all[:min(BGN_SAMPLES, len(idx_all))]
+exp_idx  = idx_all[:min(EXPL_SAMPLES, len(idx_all))]
+
+X_bg  = X_all[bg_idx]
+X_exp = X_all[exp_idx]
+
+# -------------------- SHAP: KernelExplainer --------------------
+# obs: KernelExplainer é custoso; BGN_SAMPLES/EXPL_SAMPLES controlam o tempo
+explainer = shap.KernelExplainer(model=svr_pipe.predict, data=shap.kmeans(X_bg, k=min(50, len(X_bg))))
+shap_values = explainer.shap_values(X_exp, nsamples="auto")  # pode ajustar nsamples p/ acelerar
+
+np.save(OUT_XAI / "shap_values.npy", shap_values)
+np.save(OUT_XAI / "X_exp.npy", X_exp)
+with open(OUT_XAI / "feature_names.json","w") as f:
+    json.dump(FEATURES, f)
+print("[XAI] SHAP concluído e salvo.")
+
+# ---- Gráficos SHAP globais ----
+plt.figure(figsize=(8,6))
+shap.summary_plot(shap_values, X_exp, feature_names=FEATURES, max_display=TOP_K_PLOTS, show=False)
+plt.tight_layout(); plt.savefig(OUT_XAI / "shap_summary_beeswarm.png", dpi=180); plt.close()
+
+plt.figure(figsize=(8,6))
+shap.summary_plot(shap_values, X_exp, feature_names=FEATURES, max_display=TOP_K_PLOTS, plot_type="bar", show=False)
+plt.tight_layout(); plt.savefig(OUT_XAI / "shap_summary_bar.png", dpi=180); plt.close()
+
+# ---- SHAP dependence (com interações) para as top-K por |SHAP| ----
+abs_means = np.mean(np.abs(shap_values), axis=0)
+topk_idx  = np.argsort(abs_means)[::-1][:min(TOP_K_PLOTS, len(FEATURES))]
+for i in topk_idx:
+    # escolhe uma possível feature de interação automaticamente
+    j = topk_idx[0] if topk_idx[0] != i else (topk_idx[1] if len(topk_idx)>1 else i)
+    plt.figure(figsize=(6,5))
+    shap.dependence_plot(i, shap_values, X_exp, feature_names=FEATURES, interaction_index=j, show=False)
+    plt.tight_layout(); plt.savefig(OUT_XAI / f"shap_dependence_{FEATURES[i]}.png", dpi=170); plt.close()
+
+# -------------------- PDP & ICE --------------------
+def pdp_ice(model, X, feat_names, feat, grid_points=N_GRID_PDP, n_ice=40, out_dir=OUT_XAI):
+    assert feat in feat_names, f"feature {feat} não está no conjunto."
+    j = feat_names.index(feat)
+    xj = X[:, j]
+    vmin, vmax = np.percentile(xj, [1, 99])
+    grid = np.linspace(vmin, vmax, grid_points)
+
+    # PDP: para cada ponto da grade, substitui a coluna j por valor fixo e predita
+    X_rep = np.repeat(X.mean(axis=0, keepdims=True), grid_points, axis=0)  # baseline = média
+    X_rep[:, j] = grid
+    pdp = model.predict(X_rep)
+
+    # ICE: seleciona amostras e varia apenas j
+    rng = np.random.RandomState(0)
+    sel = rng.choice(X.shape[0], size=min(n_ice, X.shape[0]), replace=False)
+    ICE = []
+    for idx in sel:
+        Xi = np.repeat(X[idx:idx+1, :], grid_points, axis=0)
+        Xi[:, j] = grid
+        ICE.append(model.predict(Xi))
+    ICE = np.vstack(ICE) if ICE else None
+
+    # plot
+    plt.figure(figsize=(7,5))
+    if ICE is not None:
+        for k in range(ICE.shape[0]):
+            plt.plot(grid, ICE[k, :], alpha=0.15)
+    plt.plot(grid, pdp, lw=2.2, label="PDP")
+    plt.xlabel(feat); plt.ylabel("Pred (log1p Chl-a)")  # saída do modelo é log1p
+    plt.title(f"PDP/ICE — {feat}")
+    plt.grid(alpha=0.25); plt.legend()
+    plt.tight_layout(); plt.savefig(out_dir / f"pdp_ice_{feat}.png", dpi=170); plt.close()
+
+# Gera PDP/ICE para as top-6 features
+for i in topk_idx[:6]:
+    pdp_ice(svr_pipe, X_all, FEATURES, FEATURES[i], grid_points=N_GRID_PDP, n_ice=50, out_dir=OUT_XAI)
+
+# -------------------- Surrogate interpretable --------------------
+# Treina uma árvore rasa para "imitar" o SVR (surrogate global)
+y_hat = svr_pipe.predict(X_all)
+tree = DecisionTreeRegressor(max_depth=3, random_state=RANDOM_STATE)
+tree.fit(X_all, y_hat)
+r2_sur = r2_score(y_hat, tree.predict(X_all))
+print(f"[XAI] Surrogate Tree R2 (SVR→Tree): {r2_sur:.3f}")
+
+# Importância da árvore (grosseira, só para interpretação)
+imp = pd.Series(tree.feature_importances_, index=FEATURES).sort_values(ascending=False)
+imp.to_csv(OUT_XAI / "surrogate_tree_importances.csv")
+plt.figure(figsize=(7,4))
+imp.head(12).plot.barh(); plt.gca().invert_yaxis()
+plt.title(f"Surrogate Tree importances (R2={r2_sur:.2f})")
+plt.xlabel("Gini importance"); plt.tight_layout()
+plt.savefig(OUT_XAI / "surrogate_tree_importances.png", dpi=160); plt.close()
+
+# -------------------- (Opcional) XAI em GeoTIFF de features --------------------
+def explain_features_tif(tif_path, feature_order, model, n_pixels=2000, out_dir=OUT_XAI, seed=RANDOM_STATE):
+    """
+    Supõe que a ordem das bandas no TIF corresponde à order de 'feature_order'.
+    Se o TIF veio do GEE com os mesmos nomes de banda, a ordem costuma coincidir.
+    """
+    with rio.open(tif_path) as ds:
+        B = ds.count
+        if B != len(feature_order):
+            print(f"[WARN] #bandas do TIF ({B}) != #features do modelo ({len(feature_order)}). Prosseguindo por índice.")
+        arr = ds.read()  # (B,H,W)
+        H, W = ds.height, ds.width
+    data = arr.reshape(B, -1).T.astype("float64")
+
+    # máscara de válidos
+    valid = np.isfinite(data).all(axis=1)
+    idx = np.where(valid)[0]
+    rng = np.random.default_rng(seed)
+    if idx.size == 0:
+        print("[XAI] Nenhum pixel válido no TIF.")
+        return
+    idx_sel = rng.choice(idx, size=min(n_pixels, idx.size), replace=False)
+    Xp = data[idx_sel, :]
+
+    # SHAP em amostra de pixels
+    expl = shap.KernelExplainer(model.predict, shap.kmeans(Xp, k=min(40, len(Xp))))
+    sv   = expl.shap_values(Xp, nsamples="auto")
+    np.save(out_dir / "shap_values_tif.npy", sv)
+    np.save(out_dir / "X_tif.npy", Xp)
+    shap.summary_plot(sv, Xp, feature_names=feature_order, show=False, max_display=12)
+    plt.tight_layout(); plt.savefig(out_dir / "shap_summary_tif.png", dpi=170); plt.close()
+    print("[XAI] SHAP (TIF) salvo.")
+
+if EXPLAIN_TIF and Path(TIF_FEATURES).exists():
+    explain_features_tif(TIF_FEATURES, FEATURES, svr_pipe, n_pixels=PIX_SAMPLES, out_dir=OUT_XAI)
+
+print("\n[OK] XAI concluído. Artefatos em:", OUT_XAI)
+for p in sorted(OUT_XAI.glob("*")):
+    print(" -", p)
