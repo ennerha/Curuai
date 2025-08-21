@@ -1,0 +1,334 @@
+# ============================================================
+# Counterfactuals — TOP-K por instância (multi-restart + diversidade)
+# Versão otimizada: predição em lote, annealing eficiente e restarts paralelos
+# Requisitos pré-existentes no notebook:
+#   - svr_pipe  : pipeline treinado (e.g., SVR dentro de um Pipeline do scikit-learn)
+#   - X_all     : np.ndarray (n_amostras, n_features)
+#   - FEATURES  : lista de nomes de features, len == n_features
+# ============================================================
+
+import os, math
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # garante backend não interativo (mais rápido em lote/headless)
+import matplotlib.pyplot as plt
+from joblib import Parallel, delayed
+
+# -------------------- Paths --------------------
+CF_OUTDIR = "/content/xai_outputs/cf"
+os.makedirs(CF_OUTDIR, exist_ok=True)
+
+# -------------------- Config --------------------
+# Alvos (defina um OU o outro)
+target_mgm3   = 30.0
+target_log1p  = None
+
+# Quais instâncias gerar CFs
+instances_idx = [0, 1, 2]
+
+# Recursos imutáveis (por nome em FEATURES ou por índice)
+IMMUTABLE_FEATURES = []          # e.g., ["latitude","longitude"] ou [0, 5]
+
+# Limites usados para manter CFs dentro do suporte dos dados
+LOW_Q, HIGH_Q = 0.01, 0.99
+
+# Função de perda e busca
+LAMBDA_DIST   = 0.25             # peso da distância L1/MAD
+MAX_ITERS     = 800
+COOLING       = 0.997
+INIT_STEP     = 0.30
+MIN_STEP      = 1e-4
+TOL_Y         = 1e-3
+NO_IMPROVE_K  = 60
+SENS_K        = 12               # nº de coordenadas testadas por iteração (sonda dirigida)
+EPS_GRAD      = 1e-3             # passo base p/ estimativa de gradiente por coordenada
+
+# Multi-restart + seleção
+N_RESTARTS        = 12           # tentativas por instância/alvo
+TOP_K_SOLUTIONS   = 5            # quantas soluções devolver por instância/alvo
+DIVERSITY_MIN_L2  = 0.65         # distância mínima entre deltas normalizados (L2)
+
+# Reprodutibilidade e saída gráfica
+RANDOM_SEED   = 42
+MAKE_PLOTS    = True             # defina False para maximizar velocidade
+PLOT_DPI      = 200              # 200 é suficiente para relatório/manuscrito
+TOP_N_CHANGES = 12               # nº de mudanças destacadas na figura
+
+# Paralelização (n_jobs=-1 usa todos os núcleos disponíveis)
+N_JOBS_RESTARTS = -1
+
+rng = np.random.default_rng(RANDOM_SEED)
+
+# -------------------- Preparos --------------------
+# Limites por quantis (float32 para menor tráfego de memória)
+X_low  = np.quantile(X_all, LOW_Q, axis=0).astype(np.float32)
+X_high = np.quantile(X_all, HIGH_Q, axis=0).astype(np.float32)
+
+# MAD robusto (float32); evita zero
+mad = np.median(np.abs(X_all - np.median(X_all, axis=0)), axis=0).astype(np.float32)
+if np.any(mad == 0):
+    repl = np.median(mad[mad > 0]) if np.any(mad > 0) else 1.0
+    mad[mad == 0] = np.float32(repl)
+
+# Índices imutáveis
+if len(IMMUTABLE_FEATURES) and isinstance(IMMUTABLE_FEATURES[0], str):
+    name_to_idx = {n: i for i, n in enumerate(FEATURES)}
+    immutable_idx = {name_to_idx[n] for n in IMMUTABLE_FEATURES if n in name_to_idx}
+else:
+    immutable_idx = set(int(i) for i in IMMUTABLE_FEATURES)
+
+# -------------------- Utilitários --------------------
+def ensure_target_log1p(target_mgm3=None, target_log1p=None):
+    if target_log1p is not None:
+        return [float(target_log1p)] if np.isscalar(target_log1p) else [float(t) for t in target_log1p]
+    if target_mgm3 is not None:
+        return [float(np.log1p(target_mgm3))] if np.isscalar(target_mgm3) else [float(np.log1p(t)) for t in target_mgm3]
+    raise ValueError("Defina target_mgm3 OU target_log1p.")
+
+y_targets = ensure_target_log1p(target_mgm3, target_log1p)
+
+# Predição em lote
+def predict_batch(X_batch: np.ndarray) -> np.ndarray:
+    Xb = X_batch.reshape(1, -1) if X_batch.ndim == 1 else X_batch
+    return svr_pipe.predict(Xb)
+
+def predict_y(x_row: np.ndarray) -> float:
+    return float(predict_batch(x_row)[0])
+
+# Perda: erro quadrático na saída + L1/MAD
+def loss_fun(x: np.ndarray, x0: np.ndarray, y_t: float):
+    dist_term = float(np.sum(np.abs((x - x0) / mad)))
+    y_hat = float(predict_batch(x)[0])
+    return (y_hat - y_t)**2 + LAMBDA_DIST * dist_term, y_hat, dist_term
+
+# Proposição dirigida (sonda coordenadas em lote)
+def propose_directed(x: np.ndarray, y_hat: float, y_t: float, step_frac: float):
+    n = x.size
+    idx_pool = np.arange(n)
+
+    if immutable_idx:
+        mask_mut = np.ones(n, dtype=bool)
+        mask_mut[list(immutable_idx)] = False
+        idx_pool = idx_pool[mask_mut]
+        if idx_pool.size == 0:
+            return x.copy(), None
+
+    k = int(min(SENS_K, idx_pool.size))
+    cand_idx = rng.choice(idx_pool, size=k, replace=False)
+
+    spans = np.maximum(X_high[cand_idx] - X_low[cand_idx], 1e-12)
+    base = EPS_GRAD * spans
+
+    # monta 2*k pontos (x+ e x-) para estimar gradiente por diferença central
+    Xp = np.tile(x, (k, 1))
+    Xm = np.tile(x, (k, 1))
+    rows = np.arange(k)
+    Xp[rows, cand_idx] = np.clip(Xp[rows, cand_idx] + base, X_low[cand_idx], X_high[cand_idx])
+    Xm[rows, cand_idx] = np.clip(Xm[rows, cand_idx] - base, X_low[cand_idx], X_high[cand_idx])
+
+    y_p = predict_batch(Xp)
+    y_m = predict_batch(Xm)
+    dy = y_p - y_m
+
+    sign_goal = np.sign(y_t - y_hat)
+    dir_j = np.sign(dy) * sign_goal
+    valid = dir_j != 0
+    if not np.any(valid):
+        return x.copy(), None
+
+    cand_idx = cand_idx[valid]
+    dir_j = dir_j[valid]
+    spans = spans[valid]
+
+    steps = dir_j * step_frac * spans
+    Xc = np.tile(x, (cand_idx.size, 1))
+    rows = np.arange(cand_idx.size)
+    Xc[rows, cand_idx] = np.clip(Xc[rows, cand_idx] + steps, X_low[cand_idx], X_high[cand_idx])
+
+    y_new = predict_batch(Xc)
+    gains = np.abs(y_hat - y_t) - np.abs(y_new - y_t)
+    best = int(np.argmax(gains))
+    return Xc[best].copy(), int(cand_idx[best])
+
+# Simulated annealing por coordenadas (reutiliza estado corrente)
+def coordinate_annealing(x0: np.ndarray, y_t: float,
+                         max_iters=MAX_ITERS, init_step=INIT_STEP, min_step=MIN_STEP, cooling=COOLING):
+    x = x0.copy()
+    step, T = init_step, 1.0
+    best_x = x.copy()
+    best_loss, best_y, best_dist = loss_fun(x, x0, y_t)
+    cur_loss, cur_y, cur_dist = best_loss, best_y, best_dist
+    no_improve = 0
+
+    for _ in range(max_iters):
+        cand, j = propose_directed(x, cur_y, y_t, step)
+        if j is None:
+            # fallback aleatório
+            j = int(rng.integers(0, x.size))
+            if j in immutable_idx:
+                continue
+            span = max(X_high[j] - X_low[j], 1e-9)
+            cand = x.copy()
+            cand[j] = np.clip(cand[j] + (rng.uniform(-1, 1) * step) * span, X_low[j], X_high[j])
+
+        L_new, y_new, dist_new = loss_fun(cand, x0, y_t)
+
+        if (L_new <= cur_loss) or (rng.random() < math.exp(-(L_new - cur_loss) / max(T, 1e-12))):
+            x = cand
+            cur_loss, cur_y, cur_dist = L_new, y_new, dist_new
+            if cur_loss < best_loss - 1e-12:
+                best_loss, best_y, best_dist = cur_loss, cur_y, cur_dist
+                best_x = x.copy()
+                no_improve = 0
+            else:
+                no_improve += 1
+        else:
+            no_improve += 1
+
+        if abs(best_y - y_t) <= TOL_Y:
+            break
+
+        if no_improve >= NO_IMPROVE_K:
+            j = int(rng.integers(0, x.size))
+            if j not in immutable_idx:
+                span = max(X_high[j] - X_low[j], 1e-9)
+                x[j] = np.clip(x[j] + 0.6 * step * span * rng.choice([-1, 1]), X_low[j], X_high[j])
+                cur_loss, cur_y, cur_dist = loss_fun(x, x0, y_t)
+            no_improve = 0
+
+        T *= cooling
+        step = max(step * cooling, min_step)
+
+    return best_x, best_y, best_loss, best_dist
+
+def random_start(x0: np.ndarray) -> np.ndarray:
+    x = x0.copy()
+    for j in range(x.size):
+        if j in immutable_idx:
+            continue
+        span = max(X_high[j] - X_low[j], 1e-9)
+        x[j] = np.clip(x[j] + rng.normal(0, 0.15 * span), X_low[j], X_high[j])
+    return x
+
+# Distâncias em delta normalizado por MAD
+def delta_norm(x: np.ndarray, x0: np.ndarray):
+    return (x - x0) / mad
+
+def l2_norm_delta_norm(x_cf: np.ndarray, x0: np.ndarray) -> float:
+    d = delta_norm(x_cf, x0)
+    return float(np.sqrt(np.sum(d * d)))
+
+# Seleção diversa top-K (mesmo critério do original, mas simplificado)
+def diverse_select(candidates, x0, top_k, thr):
+    selected = []
+    deltas_sel = []
+    for x_cf, y_cf, L_cf, D_cf in candidates:
+        d = delta_norm(x_cf, x0)
+        if not selected:
+            selected.append((x_cf, y_cf, L_cf, D_cf)); deltas_sel.append(d)
+        else:
+            close = any(np.linalg.norm(d - ds) < thr for ds in deltas_sel)
+            if not close:
+                selected.append((x_cf, y_cf, L_cf, D_cf)); deltas_sel.append(d)
+        if len(selected) >= top_k:
+            break
+    if not selected:
+        selected = [candidates[0]]
+    return selected
+
+# Wrapper p/ um restart (permite paralelização)
+def _run_one_restart(x0, y_t, r):
+    x_init = x0 if r == 0 else random_start(x0)
+    return coordinate_annealing(x_init, y_t)
+
+def run_restarts_parallel(x0, y_t, n_restarts=N_RESTARTS, n_jobs=N_JOBS_RESTARTS):
+    outs = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+        delayed(_run_one_restart)(x0, y_t, r) for r in range(n_restarts)
+    )
+    return outs  # lista de (x_cf, y_cf, L_cf, D_cf)
+
+# -------------------- Loop principal --------------------
+all_rows = []
+
+for idx in instances_idx:
+    if idx < 0 or idx >= X_all.shape[0]:
+        print(f"[CF] Índice fora do range: {idx} — pulando.")
+        continue
+
+    x0 = X_all[idx].astype(np.float32).copy()
+    y0 = predict_y(x0)
+    mg0 = float(np.expm1(y0))
+    print(f"[CF] Instância {idx}: y0_log1p={y0:.4f} | y0_mg/m3={mg0:.3f}")
+
+    for t_id, y_t in enumerate(y_targets, start=1):
+        # ----- múltiplas tentativas (paralelo) -----
+        outs = run_restarts_parallel(x0, y_t, n_restarts=N_RESTARTS, n_jobs=N_JOBS_RESTARTS)
+        candidates = list(outs)
+        candidates.sort(key=lambda tup: tup[2])  # por loss crescente
+
+        # ----- seleção top-K com diversidade -----
+        selected = diverse_select(candidates, x0, TOP_K_SOLUTIONS, DIVERSITY_MIN_L2)
+
+        # ----- salvar cada solução -----
+        for k, (x_cf, y_cf, L_cf, D_cf) in enumerate(selected, start=1):
+            mgcf, mgt = float(np.expm1(y_cf)), float(np.expm1(y_t))
+            print(f"   -> alvo {t_id} | sol {k}: y*={mgt:.3f} | obt={mgcf:.3f} | Δ={mgcf-mg0:+.3f} | loss={L_cf:.4f}")
+
+            delta = (x_cf - x0).astype(float)
+            rec = {
+                "instance_idx": idx,
+                "target_id": t_id,
+                "solution_rank": k,
+                "target_log1p": float(y_t),
+                "y0_log1p": float(y0),
+                "ycf_log1p": float(y_cf),
+                "y0_mgm3": float(mg0),
+                "ycf_mgm3": float(mgcf),
+                "target_mgm3": float(mgt),
+                "loss": float(L_cf),
+                "dist_L1_over_MAD": float(np.sum(np.abs((x_cf - x0) / mad))),
+                "delta_l2_over_MAD": float(l2_norm_delta_norm(x_cf, x0)),
+            }
+            for i, name in enumerate(FEATURES):
+                rec[f"Δ_{name}"]   = float(delta[i])
+                rec[f"x0_{name}"]  = float(x0[i])
+                rec[f"xcf_{name}"] = float(x_cf[i])
+            all_rows.append(rec)
+
+            if MAKE_PLOTS:
+                # 1) Antes/Alvo/CF
+                fig, ax = plt.subplots(figsize=(6, 4))
+                ax.bar(["Antes", "Alvo", "CF"], [mg0, mgt, mgcf])
+                ax.set_ylabel("Chl-a (mg/m³)")
+                ax.set_title(f"Inst {idx} • alvo {t_id} • sol {k}")
+                for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+                plt.tight_layout()
+                plt.savefig(f"{CF_OUTDIR}/cf_inst{idx}_t{t_id}_s{k}_pred.png",
+                            dpi=PLOT_DPI, bbox_inches="tight")
+                plt.close(fig)
+
+                # 2) Principais mudanças (top-N)
+                abs_delta = np.abs(delta)
+                order = np.argsort(abs_delta)[::-1][:TOP_N_CHANGES]
+                names = [FEATURES[i] for i in order][::-1]
+                vals  = [delta[i] for i in order][::-1]
+                fig, ax = plt.subplots(figsize=(7, 0.35 * len(names) + 1.5))
+                ax.barh(range(len(names)), vals)
+                ax.set_yticks(range(len(names))); ax.set_yticklabels(names)
+                ax.set_xlabel("Δ (valor sugerido)")
+                ax.set_title(f"Inst {idx} • alvo {t_id} • sol {k} — Top {len(names)} mudanças")
+                for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+                plt.tight_layout()
+                plt.savefig(f"{CF_OUTDIR}/cf_inst{idx}_t{t_id}_s{k}_deltas.png",
+                            dpi=PLOT_DPI, bbox_inches="tight")
+                plt.close(fig)
+
+# -------------------- CSV consolidado --------------------
+if all_rows:
+    df_cf = pd.DataFrame(all_rows)
+    csv_path = f"{CF_OUTDIR}/counterfactuals_topK.csv"
+    df_cf.to_csv(csv_path, index=False)
+    print(f"[CF] CSV salvo: {csv_path}")
+else:
+    print("[CF] Nenhum contrafactual gerado.")
