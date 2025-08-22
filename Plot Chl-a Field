@@ -1,0 +1,381 @@
+# ================================================
+# Clorofila-a em Curuai — Figuras "inteligentes"
+# Versão completa (X com significado: DATA e ANO)
+# Matplotlib puro (rápido/robusto para Colab/Notebook)
+# ================================================
+
+# 0) (Opcional) Upload do Excel no Colab
+# from google.colab import files
+# uploaded = files.upload()  # confirme que o arquivo ficou como 'stations.xlsx'
+
+# 1) Configurações do usuário
+XLSX_PATH       = "stations.xlsx"      # nome do arquivo após o upload
+FORCE_CHLA_COL  = None                 # ex.: "chla_ugL"  ou None p/ auto
+FORCE_DATE_COL  = None                 # ex.: "date"      ou None p/ auto
+CURUAI_TOKEN    = "curuai"             # texto a procurar p/ filtrar linhas
+REMOVE_OUTLIERS = True                 # remove outliers via IQR (1.5*IQR)
+LOG_SCALE_Y     = False                # eixo Y em log nos gráficos
+HIST_LOGX       = False                # histograma com X em log (apenas >0)
+FIG_DPI         = 180                  # resolução ao salvar
+SEED            = 42
+
+# 2) Imports
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # estável/rápido fora do modo interativo
+import matplotlib.pyplot as plt
+from pathlib import Path
+np.random.seed(SEED)
+
+# 3) Pasta de saída criada no início
+OUTDIR = Path.cwd() / "fig_chla_curuai"   # no Colab => /content/fig_chla_curuai
+OUTDIR.mkdir(parents=True, exist_ok=True)
+print(f"[OK] Pasta de saída: {OUTDIR.resolve()}")
+
+def savefig_ok(fig, filename, dpi=FIG_DPI):
+    path = OUTDIR / filename
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] Figura salva: {path}")
+
+# 4) Leitura robusta do Excel (todas as abas)
+if not Path(XLSX_PATH).exists():
+    raise FileNotFoundError(f"Arquivo Excel não encontrado: {XLSX_PATH}")
+
+xls = pd.ExcelFile(XLSX_PATH)
+dfs = []
+for sh in xls.sheet_names:
+    try:
+        df_sh = pd.read_excel(XLSX_PATH, sheet_name=sh)
+        df_sh["__sheet__"] = sh
+        dfs.append(df_sh)
+    except Exception as e:
+        print(f"[WARN] Falha ao ler aba '{sh}': {e}")
+
+if not dfs:
+    raise RuntimeError("Não consegui ler nenhuma planilha do Excel.")
+
+df_all = pd.concat(dfs, ignore_index=True)
+df_all.columns = [str(c).strip() for c in df_all.columns]
+
+# 5) Filtrar apenas Curuai (busca textual ampla na linha)
+mask_curuai = df_all.astype(str).apply(
+    lambda row: CURUAI_TOKEN.lower() in " ".join(row.values).lower(),
+    axis=1
+)
+df = df_all[mask_curuai].copy()
+if df.empty:
+    raise RuntimeError(f"Nenhuma linha correspondente a '{CURUAI_TOKEN}' foi encontrada.")
+
+# 6) Detectar coluna de clorofila (se não forçar)
+def _pick_chla_col(df: pd.DataFrame) -> str:
+    if FORCE_CHLA_COL and FORCE_CHLA_COL in df.columns:
+        return FORCE_CHLA_COL
+    preferred = [
+        "chla_mg_m3","chla_mgm3","chla_mgL","chla_ugL","chl_a","chl-a",
+        "chlorophyll_a","chlorophyll-a","clorofila_a","clorofila-a","chla","chlorophyll","clorofila"
+    ]
+    cand = [c for c in df.columns if any(k in c.lower() for k in ["chl","clor","chlor"])]
+    for p in preferred:
+        for c in cand:
+            if c.lower() == p.lower():
+                return c
+    def _score(c):
+        s = c.lower(); sc = 0
+        if "mg" in s and ("m3" in s or "/m3" in s): sc += 3
+        if "ug" in s or "µg" in s: sc += 2
+        if "chl" in s or "chlor" in s or "clor" in s: sc += 2
+        if "mean" in s or "media" in s: sc += 1
+        return sc
+    if cand:
+        return sorted(cand, key=_score, reverse=True)[0]
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols:
+        var = df[num_cols].var(numeric_only=True).fillna(0)
+        return var.sort_values(ascending=False).index[0]
+    raise RuntimeError("Não encontrei coluna de clorofila adequada.")
+
+chla_col = _pick_chla_col(df)
+
+# 7) Detectar coluna de data (se não forçar)
+def _pick_date_col(df: pd.DataFrame):
+    if FORCE_DATE_COL and FORCE_DATE_COL in df.columns:
+        return FORCE_DATE_COL
+    candidates = [c for c in df.columns if any(k in c.lower() for k in ["date","data","datetime","time","timestamp"])]
+    if candidates:
+        return candidates[0]
+    cols = [c.lower() for c in df.columns]
+    has_year = any(c in cols for c in ["ano","year"])
+    has_month = any(c in cols for c in ["mes","month"])
+    if has_year and has_month:
+        return None  # compor a partir de (ano, mês [, dia])
+    return None
+
+date_col = _pick_date_col(df)
+
+# 8) Preparar série de clorofila (numérico) e datas (se houver)
+df["_chl"] = pd.to_numeric(df[chla_col], errors="coerce")
+df = df[df["_chl"].notna()].copy()
+if df.empty:
+    raise RuntimeError("Após converter para numérico, não restaram valores de clorofila válidos.")
+
+if date_col:
+    df["_date"] = pd.to_datetime(df[date_col], errors="coerce")
+else:
+    yr = next((c for c in df.columns if c.lower() in ["ano","year"]), None)
+    mo = next((c for c in df.columns if c.lower() in ["mes","month"]), None)
+    dy = next((c for c in df.columns if c.lower() in ["dia","day"]), None)
+    if yr is not None and mo is not None:
+        _dparts = {"year": pd.to_numeric(df[yr], errors="coerce"),
+                   "month": pd.to_numeric(df[mo], errors="coerce"),
+                   "day": pd.to_numeric(df[dy], errors="coerce") if dy is not None else 1}
+        df["_date"] = pd.to_datetime(_dparts, errors="coerce")
+    else:
+        df["_date"] = pd.NaT
+
+# 9) Outliers por IQR (opcional)
+def remove_outliers_iqr(s: pd.Series, k: float = 1.5) -> pd.Series:
+    s = s.dropna()
+    q1, q3 = s.quantile(0.25), s.quantile(0.75)
+    iqr = q3 - q1
+    lo = q1 - k*iqr
+    hi = q3 + k*iqr
+    return s[(s >= lo) & (s <= hi)]
+
+df["_chl_raw"] = df["_chl"].copy()
+if REMOVE_OUTLIERS and len(df) > 10:
+    kept = remove_outliers_iqr(df["_chl"])
+    df = df[df["_chl"].isin(kept)].copy()
+
+# 10) Utilitário de estilo
+def _apply_common(ax, title, ylabel="Chl-a", logy=False):
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_xlabel("")
+    if logy:
+        ax.set_yscale("log")
+    ax.grid(True, alpha=0.25)
+
+# 11) Figura 1 — Nuvem de concentrações (somente valores)
+fig1, ax1 = plt.subplots(figsize=(8,5))
+ax1.plot(df["_chl"].values, marker="o", linestyle="", alpha=0.7)
+ax1.set_xlabel("Observações")
+_apply_common(ax1, "Concentrações de Clorofila-a — Curuai (apenas valores)",
+              ylabel=chla_col, logy=LOG_SCALE_Y)
+savefig_ok(fig1, "01_chla_curuai_values.png")
+
+# 12) Figura 2 — Série temporal (se houver datas válidas)
+has_dates = df["_date"].notna().any()
+if has_dates:
+    dft = df.sort_values("_date")
+    fig2, ax2 = plt.subplots(figsize=(10,5))
+    ax2.plot(dft["_date"], dft["_chl"], marker="o", linestyle="", alpha=0.7)
+    ax2.set_xlabel("Data")
+    _apply_common(ax2, "Concentrações de Clorofila-a — Curuai (série temporal)",
+                  ylabel=chla_col, logy=LOG_SCALE_Y)
+    fig2.autofmt_xdate()
+    savefig_ok(fig2, "02_chla_curuai_timeseries.png")
+else:
+    print("[INFO] Sem datas válidas para série temporal.")
+
+# 13) Figuras com X significativo (DATA e ANO categórico)
+if has_dates:
+    df["year"] = df["_date"].dt.year
+
+    # 3A — X = DATA (série temporal colorida por ano)
+    fig3a, ax3a = plt.subplots(figsize=(10,6))
+    for y, sub in df.groupby("year"):
+        if pd.isna(y):
+            continue
+        ax3a.scatter(sub["_date"], sub["_chl"], alpha=0.7, label=str(int(y)))
+    ax3a.set_xlabel("Data")
+    _apply_common(ax3a, "Clorofila-a — Curuai (série temporal, por ano)",
+                  ylabel=chla_col, logy=LOG_SCALE_Y)
+    ax3a.legend(title="Ano", ncol=2, fontsize=9)
+    fig3a.autofmt_xdate()
+    savefig_ok(fig3a, "03A_chla_curuai_by_year_timescatter.png")
+
+    # 3B — X = ANO (categórico com jitter)
+    years = sorted(int(y) for y in df["year"].dropna().unique())
+    pos = {y:i for i,y in enumerate(years)}
+    fig3b, ax3b = plt.subplots(figsize=(10,6))
+    for y in years:
+        sub = df[df["year"]==y]
+        x = pos[y] + (np.random.rand(len(sub)) - 0.5)*0.3  # jitter horizontal
+        ax3b.scatter(x, sub["_chl"], alpha=0.7, label=str(y))
+    ax3b.set_xticks(list(pos.values()))
+    ax3b.set_xticklabels([str(y) for y in years])
+    ax3b.set_xlabel("Ano")
+    _apply_common(ax3b, "Clorofila-a — Curuai (dispersão por ano, X categórico)",
+                  ylabel=chla_col, logy=LOG_SCALE_Y)
+    ax3b.legend(title="Ano", ncol=2, fontsize=9)
+    savefig_ok(fig3b, "03B_chla_curuai_by_year_scatter_categ.png")
+else:
+    print("[INFO] Sem datas válidas; gráficos com X=Data/Ano não foram gerados.")
+
+# 14) Figura 4 — Boxplot por ano (se houver datas)
+if has_dates:
+    order = sorted([int(y) for y in df["year"].dropna().unique()])
+    data_by_year = [df.loc[df["year"]==y, "_chl"].values for y in order]
+    fig4, ax4 = plt.subplots(figsize=(10,6))
+    ax4.boxplot(data_by_year, labels=[str(y) for y in order], showfliers=not REMOVE_OUTLIERS)
+    ax4.set_xlabel("Ano da campanha")
+    _apply_common(ax4, "Clorofila-a — Curuai (boxplot por ano)",
+                  ylabel=chla_col, logy=LOG_SCALE_Y)
+    savefig_ok(fig4, "04_chla_curuai_box_by_year.png")
+
+# 15) Figura 5 — Histograma das concentrações
+vals = df["_chl"].dropna()
+fig5, ax5 = plt.subplots(figsize=(8,5))
+if HIST_LOGX:
+    vals = vals[vals > 0]
+    ax5.hist(vals, bins=30)
+    ax5.set_xscale("log")
+else:
+    ax5.hist(vals, bins=30)
+_apply_common(ax5, "Histograma — Clorofila-a (Curuai)", ylabel="Frequência", logy=False)
+ax5.set_xlabel(chla_col)
+savefig_ok(fig5, "05_chla_curuai_hist.png")
+
+# 16) Tabela-resumo impressa
+summary = {
+    "n": int(vals.shape[0]),
+    "min": float(vals.min()) if len(vals) else np.nan,
+    "q25": float(vals.quantile(0.25)) if len(vals) else np.nan,
+    "median": float(vals.median()) if len(vals) else np.nan,
+    "mean": float(vals.mean()) if len(vals) else np.nan,
+    "q75": float(vals.quantile(0.75)) if len(vals) else np.nan,
+    "max": float(vals.max()) if len(vals) else np.nan,
+}
+print("\n==== Resumo (após filtro de outliers)" if REMOVE_OUTLIERS else "\n==== Resumo (sem remover outliers)")
+for k,v in summary.items():
+    print(f"{k:>7s}: {v}")
+print(f"\nColuna de clorofila usada: {chla_col}")
+print(f"Coluna de data usada: {date_col or '(inferida/ausente)'}")
+print(f"As figuras foram salvas em: {OUTDIR}/")
+
+# 17) Figura 6 — Violino por ano (com boxplot embutido)
+if df["_date"].notna().any():
+    df["year"] = df["_date"].dt.year
+    years = sorted(int(y) for y in df["year"].dropna().unique())
+    data_by_year = [df.loc[df["year"] == y, "_chl"].dropna().values for y in years]
+
+    # opcional: filtra anos com poucas amostras (ex.: < 2)
+    years_f, data_f = [], []
+    for y, v in zip(years, data_by_year):
+        v = v[np.isfinite(v)]
+        if v.size >= 2:
+            years_f.append(y); data_f.append(v)
+    if len(data_f) == 0:
+        print("[INFO] Sem dados suficientes para o violino por ano.")
+    else:
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        fig6, ax6 = plt.subplots(figsize=(12, 6))
+
+        # violinos
+        parts = ax6.violinplot(
+            data_f,
+            positions=np.arange(len(years_f)),
+            widths=0.8,
+            showmeans=False, showmedians=False, showextrema=False
+        )
+
+        # cores (gradiente viridis)
+        cmap = plt.cm.viridis
+        for i, b in enumerate(parts['bodies']):
+            b.set_facecolor(cmap(i / max(1, len(years_f) - 1)))
+            b.set_edgecolor("black")
+            b.set_linewidth(0.6)
+            b.set_alpha(0.9)
+
+        # boxplot por cima (sem outliers se REMOVE_OUTLIERS=True)
+        bp = ax6.boxplot(
+            data_f,
+            positions=np.arange(len(years_f)),
+            widths=0.15,
+            vert=True,
+            showfliers=not REMOVE_OUTLIERS,
+            patch_artist=True
+        )
+        for box in bp['boxes']:
+            box.set_facecolor("white")
+            box.set_alpha(0.9)
+            box.set_edgecolor("black")
+        for med in bp['medians']:
+            med.set_linewidth(1.5)
+
+        ax6.set_xticks(np.arange(len(years_f)))
+        ax6.set_xticklabels([str(y) for y in years_f])
+        if LOG_SCALE_Y:
+            ax6.set_yscale("log")
+        ax6.set_ylabel(chla_col)
+        ax6.set_title("Clorofila-a — Curuai (violino por ano)")
+        ax6.grid(True, which="both", axis="y", alpha=0.25)
+
+        savefig_ok(fig6, "06_chla_curuai_violin_by_year.png")
+else:
+    print("[INFO] Sem datas válidas; violino por ano não será gerado.")
+
+# 17) Estatísticas descritivas (robusto + Excel com fallback)
+import numpy as np, pandas as pd, importlib
+
+def _desc_stats(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return pd.Series(
+            {"n": 0, "min": np.nan, "q25": np.nan, "median": np.nan, "mean": np.nan,
+             "q75": np.nan, "max": np.nan, "std": np.nan, "iqr": np.nan,
+             "cv_%": np.nan, "gmean": np.nan}
+        )
+    q25 = s.quantile(0.25); q75 = s.quantile(0.75)
+    iqr = q75 - q25
+    std = s.std(ddof=1)
+    mean = s.mean()
+    cv = (std / mean * 100.0) if mean != 0 else np.nan
+    gmean = float(np.exp(np.log(s[s > 0]).mean())) if (s > 0).any() else np.nan
+    return pd.Series(
+        {"n": int(s.size), "min": s.min(), "q25": q25, "median": s.median(), "mean": mean,
+         "q75": q75, "max": s.max(), "std": std, "iqr": iqr, "cv_%": cv, "gmean": gmean}
+    )
+
+# Geral
+overall_stats = _desc_stats(df["_chl"]).to_frame(name="overall").T.round(3)
+print("\n==== Estatísticas gerais de Clorofila-a (Curuai) ====")
+print(overall_stats.to_string())
+
+# Por ano (se houver datas)
+by_year_stats_round = None
+if df["_date"].notna().any():
+    if "year" not in df.columns:
+        df["year"] = df["_date"].dt.year
+    by_year_stats = df.groupby("year")["_chl"].apply(_desc_stats).unstack()  # anos nas linhas, métricas nas colunas
+    by_year_stats_round = by_year_stats.round(3)
+    print("\n==== Estatísticas por ano (Clorofila-a) ====")
+    print(by_year_stats_round.to_string())
+
+# Salvar CSVs
+(overall_stats).to_csv(OUTDIR / "stats_overall.csv")
+if by_year_stats_round is not None:
+    by_year_stats_round.to_csv(OUTDIR / "stats_by_year.csv")
+
+# Salvar Excel com engine disponível
+excel_path = OUTDIR / "stats_summary.xlsx"
+engine = None
+if importlib.util.find_spec("xlsxwriter") is not None:
+    engine = "xlsxwriter"
+elif importlib.util.find_spec("openpyxl") is not None:
+    engine = "openpyxl"
+
+if engine:
+    with pd.ExcelWriter(excel_path, engine=engine) as xlw:
+        overall_stats.to_excel(xlw, sheet_name="overall")
+        if by_year_stats_round is not None:
+            by_year_stats_round.to_excel(xlw, sheet_name="by_year")
+    print(f"\n[OK] Excel: {excel_path} (engine={engine})")
+else:
+    print("\n[WARN] Sem 'xlsxwriter' ou 'openpyxl'; pulei o Excel.")
+    print("      Para habilitar no Colab: !pip -q install xlsxwriter  # ou: pip -q install openpyxl")
