@@ -1,0 +1,204 @@
+# ============================================================
+# Rrs (Curuai) + simulação MODIS (Aqua/Terra) com RSR — versão clean
+# Saídas: curvas médias ±1σ (campo e bandas) e CSV com Rrs simulada
+# Requisitos: pandas, numpy, matplotlib, xarray
+# ============================================================
+
+# ================== CONFIG ==================
+STATION_KEY = "curuai"  # filtro textual (case-insensitive). Use None p/ não filtrar
+OUTDIR_NAME = "rrs_modis_out"
+# Arquivos (o script tenta /content e /mnt/data automaticamente)
+F_RRS   = "rrs.xlsx"
+F_AQUA  = "aqua_modis_RSR.nc"
+F_TERRA = "terra_modis_RSR.nc"
+FIG_DPI = 300
+
+# ================ IMPORTS ===================
+import os, re
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ================ PATHS =====================
+def _first_existing(*cands):
+    for p in cands:
+        if Path(p).exists(): return str(Path(p))
+    return str(Path(cands[-1]))  # último como padrão
+
+BASES = ["/content", "/mnt/data", "."]
+RRS_XLSX  = _first_existing(*(str(Path(b)/F_RRS) for b in BASES))
+AQUA_NC   = _first_existing(*(str(Path(b)/F_AQUA) for b in BASES))
+TERRA_NC  = _first_existing(*(str(Path(b)/F_TERRA) for b in BASES))
+OUTDIR    = Path(_first_existing(*(str(Path(b)/OUTDIR_NAME) for b in BASES)))
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+print("[INFO] RRS:", RRS_XLSX)
+print("[INFO] AQUA RSR:", AQUA_NC)
+print("[INFO] TERRA RSR:", TERRA_NC)
+print("[OK]  OUTDIR:", OUTDIR.resolve())
+
+# ============== LEITURA Rrs (WIDE) ==========
+df = pd.read_excel(RRS_XLSX, sheet_name=0)
+
+# filtro por estação (se houver alguma coluna de identificação)
+if STATION_KEY:
+    station_cols = [c for c in df.columns if any(k in str(c).lower()
+                       for k in ["station","local","site","name","lago","lagoon","estacao","estação","ponto"])]
+    mask = None
+    for c in station_cols:
+        m = df[c].astype(str).str.lower().str.contains(STATION_KEY)
+        if m.any(): mask = m if mask is None else (mask | m)
+    if mask is not None:
+        df = df[mask].copy()
+        print(f"[OK] Filtrado '{STATION_KEY}': {len(df)} linhas.")
+    else:
+        print("[WARN] Não encontrei coluna de estação com", STATION_KEY, "— usando todas as linhas.")
+
+# detectar colunas Rrs_###
+w_cols, w_nm = [], []
+for c in df.columns:
+    s = str(c)
+    s_low = s.lower()
+    if "rrs" in s_low:
+        m = re.findall(r"(\d{3,4})", s_low)
+        if m:
+            nm = int(m[-1])
+            if 350 <= nm <= 900:
+                w_cols.append(c); w_nm.append(nm)
+
+if not w_cols:
+    raise RuntimeError("Nenhuma coluna de espectro encontrada (esperado algo como 'Rrs_400', ..., 'Rrs_900').")
+
+order = np.argsort(w_nm)
+w_cols = [w_cols[i] for i in order]
+w_nm   = np.array([w_nm[i] for i in order], dtype=float)
+
+R = df[w_cols].apply(pd.to_numeric, errors="coerce").values  # (n_amostras, n_wl)
+valid_rows = np.isfinite(R).sum(axis=1) >= 5
+R = R[valid_rows]
+n_samples = R.shape[0]
+if n_samples == 0:
+    raise RuntimeError("Sem espectros válidos após a limpeza.")
+
+print(f"[OK] Espectros válidos: {n_samples} | Faixa λ: {w_nm.min():.0f}–{w_nm.max():.0f} nm")
+
+# ============== FIGURA 1 — Rrs (média ±1σ) ==============
+grid = np.arange(w_nm.min(), w_nm.max() + 1, 1.0)
+R_grid = np.array([np.interp(grid, w_nm, r, left=np.nan, right=np.nan) for r in R])
+mu = np.nanmean(R_grid, axis=0)
+sd = np.nanstd(R_grid, axis=0)
+
+fig, ax = plt.subplots(figsize=(8, 4.8))
+ax.plot(grid, mu, linewidth=2)
+ax.fill_between(grid, mu - sd, mu + sd, alpha=0.25)
+ax.set_xlabel("wavelength (nm)")
+ax.set_ylabel("in situ Rrs (sr$^{-1}$)")
+ax.set_title("Rrs — Curuai (média ± 1σ)")
+ax.grid(True, axis="y", alpha=0.3)
+ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+p_field = OUTDIR / "clean_01_rrs_field_mean_sd.png"
+plt.tight_layout(); plt.savefig(p_field, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+print("[OK] Figura (campo):", p_field)
+
+# ============== RSR (Aqua/Terra) ==============
+def load_rsr_dict(nc_path, sensor_label):
+    ds = xr.open_dataset(nc_path)
+    wl = ds["wavelength"].values.astype(float)  # nm
+    RSR = ds["RSR"].values.astype(float)       # (bands, wavelengths)
+    # garante ordem crescente de λ
+    if not np.all(np.diff(wl) >= 0):
+        ord_w = np.argsort(wl); wl = wl[ord_w]; RSR = RSR[:, ord_w]
+    bands = {}
+    centers = []
+    for i in range(RSR.shape[0]):
+        r = RSR[i]
+        good = np.isfinite(wl) & np.isfinite(r) & (r > 0)
+        if not good.any():
+            continue
+        num = np.trapz(wl[good]*r[good], wl[good]); den = np.trapz(r[good], wl[good])
+        c = num/den if den > 0 else np.nan
+        if not np.isfinite(c):
+            continue
+        centers.append(c)
+        bands[f"{sensor_label}_B{int(round(c))}"] = (wl[good], r[good])  # sem normalizar; integraremos com divisão pelo den
+    return bands, np.array(centers, float)
+
+rsr_aqua,  cent_aqua  = load_rsr_dict(AQUA_NC,  "AQUA")
+rsr_terra, cent_terra = load_rsr_dict(TERRA_NC, "TERRA")
+# manter só bandas compatíveis com a faixa de Rrs
+keys_aqua  = [k for k,c in zip(rsr_aqua.keys(),  cent_aqua)  if (c >= w_nm.min()-5) and (c <= w_nm.max()+5)]
+keys_terra = [k for k,c in zip(rsr_terra.keys(), cent_terra) if (c >= w_nm.min()-5) and (c <= w_nm.max()+5)]
+
+print(f"[OK] Bandas Aqua usadas:  {len(keys_aqua)} | Terra: {len(keys_terra)}")
+
+# ============== Integração espectral ==============
+def integrate_band(rrs_w_nm, rrs_vals, srf_w, srf_r):
+    r_i = np.interp(srf_w, rrs_w_nm, rrs_vals, left=np.nan, right=np.nan)
+    good = np.isfinite(r_i) & np.isfinite(srf_r)
+    if not good.any():
+        return np.nan
+    num = np.trapz(r_i[good] * srf_r[good], srf_w[good])
+    den = np.trapz(srf_r[good], srf_w[good])
+    return float(num / den) if den > 0 else np.nan
+
+def simulate(keys, rsr_dict):
+    out = np.full((n_samples, len(keys)), np.nan, float)
+    den_centers = []
+    for j, k in enumerate(keys):
+        sw, sr = rsr_dict[k]
+        den_centers.append(int(round(float(k.split("B")[-1]))))
+        for i in range(n_samples):
+            out[i, j] = integrate_band(w_nm, R[i], sw, sr)
+    return np.array(den_centers, float), out
+
+cent_a, A = simulate(keys_aqua,  rsr_aqua)
+cent_t, T = simulate(keys_terra, rsr_terra)
+
+# CSV com Rrs simulada
+df_aqua  = pd.DataFrame(A, columns=keys_aqua)
+df_terra = pd.DataFrame(T, columns=keys_terra)
+df_sim = pd.concat([df_aqua, df_terra], axis=1)
+p_csv = OUTDIR / "rrs_modis_simulated.csv"
+df_sim.to_csv(p_csv, index=False)
+print("[OK] CSV Rrs simulada:", p_csv)
+
+# ============== FIGURAS clean — média ±1σ ==============
+def plot_mean_sd(centers, values, title, fname):
+    mu = np.nanmean(values, axis=0); sd = np.nanstd(values, axis=0)
+    order = np.argsort(centers)
+    centers, mu, sd = centers[order], mu[order], sd[order]
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(centers, mu, linewidth=2, marker="o")
+    ax.fill_between(centers, mu - sd, mu + sd, alpha=0.25)
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_ylabel("simulated Rrs (sr$^{-1}$)")
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+    path = OUTDIR / fname
+    plt.tight_layout(); plt.savefig(path, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+    print("[OK] Figura:", path)
+
+plot_mean_sd(cent_a, A, "MODIS Aqua — Rrs simulada (média ± 1σ)", "clean_02_rrs_modis_aqua_mean_sd.png")
+plot_mean_sd(cent_t, T, "MODIS Terra — Rrs simulada (média ± 1σ)", "clean_03_rrs_modis_terra_mean_sd.png")
+
+# (Opcional) Overlay Aqua x Terra em um gráfico
+mu_a, sd_a = np.nanmean(A, axis=0), np.nanstd(A, axis=0)
+mu_t, sd_t = np.nanmean(T, axis=0), np.nanstd(T, axis=0)
+oa, ot = np.argsort(cent_a), np.argsort(cent_t)
+fig, ax = plt.subplots(figsize=(8, 4.8))
+ax.plot(cent_a[oa], mu_a[oa], linewidth=2, marker="o", label="Aqua")
+ax.fill_between(cent_a[oa], mu_a[oa]-sd_a[oa], mu_a[oa]+sd_a[oa], alpha=0.18)
+ax.plot(cent_t[ot], mu_t[ot], linewidth=2, marker="o", label="Terra")
+ax.fill_between(cent_t[ot], mu_t[ot]-sd_t[ot], mu_t[ot]+sd_t[ot], alpha=0.18)
+ax.set_xlabel("wavelength (nm)")
+ax.set_ylabel("simulated Rrs (sr$^{-1}$)")
+ax.set_title("MODIS Aqua vs Terra — Rrs simulada (média ± 1σ)")
+ax.grid(True, axis="y", alpha=0.3)
+ax.spines["top"].set_visible(False); ax.spines["right"].set_visible(False)
+ax.legend(frameon=False)
+p_overlay = OUTDIR / "clean_04_rrs_modis_overlay.png"
+plt.tight_layout(); plt.savefig(p_overlay, dpi=FIG_DPI, bbox_inches="tight"); plt.close(fig)
+print("[OK] Figura:", p_overlay)
