@@ -1,0 +1,30 @@
+# ============================
+# EARTH ENGINE INIT (com project)
+# ============================
+import os, ee
+
+EE_PROJECT = "ee-enneralcantarabariri"   # <-- seu projeto
+
+def ee_init(project=EE_PROJECT):
+    try:
+        ee.Initialize(project=project)
+        print("EE ok:", project)
+        return
+    except Exception as e:
+        print("Primeira tentativa falhou:", e)
+
+    # Tenta fluxo de autenticação
+    try:
+        import geemap
+        geemap.ee_initialize(project=project)
+        print("EE ok (geemap):", project)
+        return
+    except Exception as e:
+        print("geemap falhou, tentando fluxo nativo:", e)
+
+    # Fallback nativo (abre URL para login)
+    ee.Authenticate()           # siga o link, cole o token
+    ee.Initialize(project=project)
+    print("EE ok (native):", project)
+
+ee_init()
